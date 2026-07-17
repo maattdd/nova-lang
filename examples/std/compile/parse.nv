@@ -1,0 +1,3 @@
+// std/compile/parse.nv — Parse Nova source at compile time
+
+@extern func parse(source: String) -> Module;

@@ -1,0 +1,13 @@
+// std/compile/introspect.nv — Type introspection API (compile-time only)
+
+@extern func lookup_type(name: String) -> Item;
+@extern func type_exists(name: String) -> Bool;
+@extern func struct_fields(def: Item) -> List;
+@extern func set_name(item: Item, name: String) -> Item;
+@extern func filter_pub(items: Items) -> Items;
+
+// Field access on values (available in interpreter)
+//   module.name    → String
+//   module.items   → Items
+//   item.name      → String
+//   item.kind      → String ("Function", "Struct", "Enum", ...)

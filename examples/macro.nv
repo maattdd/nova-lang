@@ -1,0 +1,19 @@
+// Julia-style macros in Nova
+
+// Define a macro that generates a function
+macro make_adder(name, amount) {
+    quote {
+        func $name(x: Int) -> Int {
+            return x + $amount
+        }
+    }
+}
+
+@make_adder(add_five, 5)
+@make_adder(add_ten, 10)
+
+func main() -> Int {
+    let a = add_five(10);   // 15
+    let b = add_ten(10);    // 20
+    return a + b            // 35
+}

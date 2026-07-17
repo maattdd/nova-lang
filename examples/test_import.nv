@@ -1,0 +1,18 @@
+// Demonstrates the @import module system with renaming
+
+// Import everything (square, cube)
+@import("std.math")
+
+// Import with rename: square becomes sq
+@import("std.math", square = sq)
+
+// Import just one item
+@import("std.math", cube)
+
+func main() -> Int {
+    let a = square(3);   // 9 — imported from std.math
+    let b = sq(4);       // 16 — renamed import
+    let c = cube(2);     // 8 — explicitly imported
+
+    return a + b + c     // 33
+}

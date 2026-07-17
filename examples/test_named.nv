@@ -1,0 +1,10 @@
+// Test named parameters
+func greet(name: String, ~greeting: String) -> String {
+    return greeting + ", " + name
+}
+
+func main() -> Int {
+    let msg = greet("World", ~greeting: "Hello");
+    @cpp { std::cout << msg << std::endl; }
+    return 0
+}

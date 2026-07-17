@@ -1,0 +1,9 @@
+// std/math.nv — Math utilities module
+
+pub func square(x: Int) -> Int {
+    return x * x
+}
+
+pub func cube(x: Int) -> Int {
+    return x * x * x
+}

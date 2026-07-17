@@ -1,0 +1,17 @@
+// Test macro expansion
+macro make_adder(name, amount) {
+    quote {
+        func $name(x: Int) -> Int {
+            return x + $amount
+        }
+    }
+}
+
+@make_adder(add_five, 5)
+@make_adder(add_ten, 10)
+
+func main() -> Int {
+    let a = add_five(10);
+    let b = add_ten(10);
+    return a + b
+}

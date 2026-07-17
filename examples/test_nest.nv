@@ -1,0 +1,7 @@
+struct Point { x: Float, y: Float }
+struct Rect { top_left: Point, bottom_right: Point }
+
+func main() -> Int {
+    let r = Rect { top_left: Point { x: 0.0, y: 0.0 }, bottom_right: Point { x: 10.0, y: 10.0 } };
+    return 0
+}

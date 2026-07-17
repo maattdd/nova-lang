@@ -1,0 +1,11 @@
+// std/compile/import.nv — @import macro
+// Uses: std/io (read_file), std/compile/parse (parse),
+//       std/compile/introspect (filter_pub), std/compile/ast (splice)
+
+macro import(path) {
+    let file_path = path + ".nv";
+    let source = read_file(file_path);
+    let module = parse(source);
+    let pub_items = filter_pub(module.items);
+    splice(pub_items)
+}

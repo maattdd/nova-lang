@@ -1,0 +1,10 @@
+[package]
+name = "nova"
+version = "0.1.0"
+edition = "2021"
+description = "Nova language compiler — a modern systems language with Julia-like macros and ADTs, targeting C++"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+ariadne = "0.4"

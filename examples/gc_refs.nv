@@ -1,0 +1,17 @@
+// GC-managed types with @ syntax
+// Regular values are stack-allocated; @T is GC-managed
+
+struct Point {
+    value: Int,
+}
+
+// Create a GC-managed struct
+func make_point(val: Int) -> @Point {
+    let p = @Point { value: val };
+    return p
+}
+
+func main() -> Int {
+    let p = make_point(42);
+    return 0
+}

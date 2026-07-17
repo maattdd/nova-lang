@@ -1,0 +1,13 @@
+// Ruby-style no-parens calls
+@import("std/compile/debug")
+
+struct Point { x: Float, y: Float }
+
+@debug(Point)
+
+func main() -> Int {
+    let p = Point { x: 3.0, y: 2.0 };
+    p.debug           // Ruby-style: no () needed!
+    p.x
+    return 0
+}

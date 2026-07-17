@@ -1,0 +1,7 @@
+trait Foo {
+    func size(x: Int) -> Int;
+}
+
+func main() -> Int {
+    return 0
+}

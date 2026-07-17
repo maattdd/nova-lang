@@ -1,0 +1,9 @@
+// std/io.nv — Standard I/O (available at compile time and runtime)
+
+// Compile-time: reads a file from disk
+@extern func read_file(path: String) -> String;
+
+// Runtime: print to stdout
+@extern func print(msg: String);
+@extern func println(msg: String);
+@extern func print_int(n: Int);

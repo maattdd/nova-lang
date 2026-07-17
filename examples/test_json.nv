@@ -1,0 +1,19 @@
+// UFCS demo — p.to_json() with print
+@import("std/compile/json")
+
+struct Point {
+    x: Float,
+    y: Float,
+}
+
+@json(Point)
+
+func main() -> Int {
+    let p = Point { x: 3.0, y: 2.0 };
+
+    // UFCS: p.to_json() calls to_json(p)
+    let json = p.to_json();
+    print(json);
+
+    return 0
+}

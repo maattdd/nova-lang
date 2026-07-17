@@ -1,0 +1,28 @@
+// std/compile/ast.nv — AST construction API (compile-time only)
+// These functions build AST nodes. Implemented by the compiler interpreter.
+
+// ─── Literals ───
+@extern func make_string(s: String) -> Expr;
+@extern func make_int(n: Int) -> Expr;
+@extern func make_float(n: Float) -> Expr;
+@extern func make_bool(b: Bool) -> Expr;
+@extern func make_ident(name: String) -> Expr;
+
+// ─── Expressions ───
+@extern func make_field(obj: Expr, field: String) -> Expr;
+@extern func make_binary(op: String, left: Expr, right: Expr) -> Expr;
+@extern func make_call(name: String, args: List) -> Expr;
+@extern func make_return(expr: Expr) -> Expr;
+@extern func make_block(stmts: List) -> Expr;
+@extern func make_let(name: String, value: Expr) -> Expr;
+@extern func to_string(expr: Expr) -> Expr;
+
+// ─── Items ───
+@extern func make_function(name: String, params: List, ret_type: String, body: Expr) -> Item;
+@extern func make_struct(name: String, fields: List) -> Item;
+@extern func make_param(name: String, ty: String) -> List;
+
+// ─── Module ───
+@extern func splice(item: Item) -> Items;
+@extern func list(args: ...) -> List;
+@extern func list_push(list: List, element: Value) -> List;

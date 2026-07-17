@@ -1,0 +1,4 @@
+func main() -> Int {
+    foobar(42);
+    return 0
+}
