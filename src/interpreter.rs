@@ -34,6 +34,12 @@ impl Interpreter {
             if let Item::Struct(s) = item {
                 self.known_structs.insert(s.name.clone(), s.clone());
             }
+            if let Item::Trait(t) = item {
+                // Store traits too — lookup_type works for both
+                self.known_structs.insert(t.name.clone(), Struct {
+                    name: t.name.clone(), generics: vec![], fields: vec![], is_pub: true, span: Span::zero()
+                });
+            }
         }
     }
 
@@ -247,7 +253,8 @@ impl Interpreter {
                         Item::Function(f) => f.is_pub,
                         Item::Struct(s) => s.is_pub,
                         Item::Enum(e) => e.is_pub,
-                        Item::Macro(_) => true,  // macros are always importable
+                        Item::Macro(_) => true,
+                        Item::Trait(_) => true,  // macros are always importable
                         Item::TypeAlias(_) => true,
                         Item::VarDecl(_) => true,
                         _ => false,
@@ -432,6 +439,25 @@ impl Interpreter {
                     _ => vec![],
                 };
                 Ok(Value::Item(Item::Struct(Struct { name, generics: vec![], fields, is_pub: true, span: Span::zero() })))
+            },
+
+            "make_impl" => {
+                // make_impl(trait_name, target_type, [method1, method2, ...])
+                let trait_name = self.arg_string(args, 0, span)?;
+                let target = self.arg_string(args, 1, span)?;
+                let methods: Vec<Function> = match args.get(2) {
+                    Some(Value::List(list)) => list.iter().filter_map(|v| {
+                        if let Value::Item(Item::Function(ref f)) = v { Some(f.clone()) } else { None }
+                    }).collect(),
+                    _ => vec![],
+                };
+                Ok(Value::Item(Item::Impl(ImplBlock {
+                    trait_name,
+                    generics: vec![],
+                    target_type: Type::path(&target),
+                    methods,
+                    span: Span::zero(),
+                })))
             },
 
             "to_string" => {

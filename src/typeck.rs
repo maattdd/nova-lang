@@ -60,6 +60,15 @@ impl TypeChecker {
                         self.functions.entry(method.name.clone()).or_default().push(ft);
                     }
                 }
+                Item::Impl(imp) => {
+                    for method in &imp.methods {
+                        let ft = Type::Function(FunctionType {
+                            params: method.params.iter().map(|p| p.ty.clone()).collect(),
+                            ret: Box::new(method.return_type.clone()),
+                        });
+                        self.functions.entry(method.name.clone()).or_default().push(ft);
+                    }
+                }
                 Item::Function(f) => {
                     let ft = Type::Function(FunctionType {
                         params: f.params.iter().map(|p| p.ty.clone()).collect(),

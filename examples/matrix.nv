@@ -1,45 +1,36 @@
-// matrix.nv — Multi-dispatch, concrete types only (no generics)
-trait Matrix {
-    func size(m: Matrix) -> Int;
-}
+// matrix.nv — Multiple dispatch with Debug trait
+@import("std/compile/debug")
 
-struct Dense {
-    sz: Int,
-}
+trait Matrix { func size(m: Matrix) -> Int }
 
-impl Matrix for Dense {
-    func size(d: Dense) -> Int { d.sz }
-}
+struct Dense { sz: Int }
+@debug(Dense)
+impl Matrix for Dense { func size(d: Dense) -> Int { d.sz } }
 
-struct HotVector {
-    idx: Int,
-    sz: Int,
-}
+struct HotVector { idx: Int, sz: Int }
+@debug(HotVector)
+impl Matrix for HotVector { func size(h: HotVector) -> Int { h.sz } }
 
-impl Matrix for HotVector {
-    func size(h: HotVector) -> Int { h.sz }
-}
+@debug(Matrix)  // ← what happens?
+
+func inner(a: Matrix, b: Matrix) -> Int { a.size() * b.size() }
+func inner(a: Matrix, b: HotVector) -> Int { a.size() + b.idx }
+func dot(a: Matrix, b: Matrix) -> Int { inner(a, b) }
 
 func make_matrix(kind: Int) -> Matrix {
-    if kind == 0 {
-        return Dense { sz: 5 }
-    } else {
-        return HotVector { idx: 2, sz: 10 }
-    }
-}
-
-func inner(a: Matrix, b: Matrix) -> Int {
-    a.size() * b.size()
-}
-
-func inner(a: Matrix, b: HotVector) -> Int {
-    a.size() + b.idx
+    if kind == 0 { return Dense { sz: 5 } }
+    else { return HotVector { idx: 3, sz: 10 } }
 }
 
 func main() -> Int {
+    let d = Dense { sz: 42 };
+    d.debug();  // calls debug(Dense) ✓
+
     let a = make_matrix(0);
+    a.debug();  // calls debug(Matrix) — generic, ignores concrete type!
+
     let b = make_matrix(1);
-    let r = inner(a, b);
-    print(r);
+    let r = dot(a, b);
+    print_int(r);
     return 0
 }

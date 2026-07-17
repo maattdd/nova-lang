@@ -1,30 +1,27 @@
-// std/compile/debug.nv — @debug: recursive field-by-field printer
-//
-// For struct fields that are themselves structs, generates recursive debug() calls.
-// For primitives (Int, Float, String, Bool), generates print() calls.
+// std/compile/debug.nv — trait Debug + @debug generates impl blocks
+trait Debug {
+    func debug(self: Debug);
+}
 
 macro debug(type_name) {
     let def = lookup_type(type_name);
     let fields = struct_fields(def);
 
     let stmts = list(make_call("print", list(make_string(type_name + " {"))));
-
     for field in fields {
         let fname = field[0];
         let ftype = field[1];
-        let val_field = make_field(make_ident("val"), fname);
-
+        let val_field = make_field(make_ident("self"), fname);
         stmts = list_push(stmts, make_call("print", list(make_string(fname + ": "))));
-
-        // If the field type is a known struct, recurse with debug_<type>()
         if type_exists(ftype) {
             stmts = list_push(stmts, make_call("debug", list(val_field)));
         } else {
             stmts = list_push(stmts, make_call("print", list(val_field)));
         }
     }
-
     stmts = list_push(stmts, make_call("print", list(make_string("}"))));
 
-    splice(make_function("debug", list(list("val", type_name)), "void", make_block(stmts)))
+    let method = make_function("debug", list(list("self", type_name)), "void", make_block(stmts));
+    let impl_block = make_impl("Debug", type_name, list(method));
+    splice(impl_block)
 }
