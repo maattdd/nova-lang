@@ -13,8 +13,10 @@ mod lsp;
 pub mod traits;
 
 use crate::error::CompileError;
+use crate::ast::Item;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::process::Command;
 use std::fs;
 
 /// Nova language compiler — compiles .nv files to C++
@@ -23,7 +25,7 @@ use std::fs;
 #[command(about = "Nova language compiler", version = "0.1.0")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Option<Commands>,
 
     /// Input .nv source file
     #[arg(value_name = "FILE")]
@@ -51,46 +53,76 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Command {
+enum Commands {
     /// Start the LSP server for IDE integration
     Lsp,
+    /// Compile a .nv file to C++ and run the resulting binary
+    Run {
+        /// Input .nv source file
+        #[arg(value_name = "FILE")]
+        input: PathBuf,
+
+        /// Include the GC runtime header inline in the output
+        #[arg(long = "standalone")]
+        standalone: bool,
+
+        /// Additional search paths for modules (can be specified multiple times)
+        #[arg(short = 'L', long = "lib-path")]
+        lib_paths: Vec<PathBuf>,
+
+        /// C++ compiler to use (default: clang++)
+        #[arg(long = "cxx", default_value = "clang++")]
+        cxx: String,
+
+        /// Keep the temporary C++ file and binary (don't delete after run)
+        #[arg(long = "keep-temp")]
+        keep_temp: bool,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    match cli.command {
-        Some(Command::Lsp) => {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            rt.block_on(lsp::run());
+    if let Some(Commands::Run { input, standalone, lib_paths, cxx, keep_temp }) = &cli.command {
+        if let Err(e) = run_nova(input, *standalone, lib_paths, &cxx, *keep_temp) {
+            let source = fs::read_to_string(input).unwrap_or_default();
+            eprintln!("{}", e.display_with_source(&source, &input.display().to_string()));
+            std::process::exit(1);
         }
-        None => {
-            let input = cli.input.clone().unwrap_or_else(|| {
-                eprintln!("Error: no input file specified and no subcommand given.");
-                eprintln!("Use `nova lsp` to start the LSP server, or `nova <file>` to compile.");
-                std::process::exit(1);
-            });
-            let file_path = input.display().to_string();
+        return;
+    }
 
-            if let Err(e) = run(&cli, &input) {
-                let source = fs::read_to_string(&input).unwrap_or_default();
-                eprintln!("{}", e.display_with_source(&source, &file_path));
-                std::process::exit(1);
-            }
-        }
+    if let Some(Commands::Lsp) = &cli.command {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(lsp::run());
+        return;
+    }
+
+    let Some(input) = cli.input.as_ref() else {
+        eprintln!("error: FILE argument or subcommand required (try 'nova run <FILE>' or 'nova --help')");
+        std::process::exit(1);
+    };
+    let file_path = input.display().to_string();
+
+    if let Err(e) = run(&cli) {
+        // Read source for error display
+        let source = fs::read_to_string(input).unwrap_or_default();
+        eprintln!("{}", e.display_with_source(&source, &file_path));
+        std::process::exit(1);
     }
 }
 
-fn run(cli: &Cli, input: &PathBuf) -> Result<(), CompileError> {
-    let source = fs::read_to_string(input)?;
-    let module_name = input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("main")
-        .to_string();
-
+fn build_cpp(
+    input: &PathBuf,
+    source: &str,
+    standalone: bool,
+    lib_paths: &[PathBuf],
+    module_name: &str,
+    print_ast: bool,
+    check_only: bool,
+) -> Result<Option<String>, CompileError> {
     // Setup search paths for @import
-    let mut search_paths = cli.lib_paths.clone();
+    let mut search_paths = lib_paths.to_vec();
     if let Some(parent) = input.parent() {
         search_paths.push(parent.to_path_buf());
     }
@@ -101,14 +133,14 @@ fn run(cli: &Cli, input: &PathBuf) -> Result<(), CompileError> {
     let interpreter = interpreter::Interpreter::new(search_paths);
 
     // Lex
-    let mut lex = lexer::Lexer::new(&source);
+    let mut lex = lexer::Lexer::new(source);
     let tokens = lex.tokenize()?;
 
     // Parse
-    let mut p = parser::Parser::new(tokens, &source);
-    let mut module = p.parse_module(module_name.clone())?;
+    let mut p = parser::Parser::new(tokens, source);
+    let mut module = p.parse_module(module_name.to_string())?;
 
-    if cli.print_ast {
+    if print_ast {
         println!("// ─── AST ───");
         println!("{:#?}", module);
         println!();
@@ -120,7 +152,7 @@ fn run(cli: &Cli, input: &PathBuf) -> Result<(), CompileError> {
     expander.register_structs(&module);
     expander.expand_module(&mut module)?;
 
-    if cli.print_ast {
+    if print_ast {
         println!("// ─── AST (after macro expansion) ───");
         println!("{:#?}", module);
         println!();
@@ -133,17 +165,16 @@ fn run(cli: &Cli, input: &PathBuf) -> Result<(), CompileError> {
     // Apply DotAccess resolutions (field vs UFCS call)
     resolve::apply_resolutions(&mut module, &resolutions);
 
-    if cli.check_only {
+    if check_only {
         println!("Type checking passed ✓");
-        return Ok(());
+        return Ok(None);
     }
 
     // Generate C++
     let generator = codegen::cpp::CppGenerator::new();
     let cpp_output = generator.generate(&module);
 
-    // Write output
-    let final_output = if cli.standalone {
+    let final_output = if standalone {
         let gc_rt_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rt").join("gc.h");
         let gc_rt = if gc_rt_path.exists() {
             fs::read_to_string(&gc_rt_path).unwrap_or_default()
@@ -156,11 +187,105 @@ fn run(cli: &Cli, input: &PathBuf) -> Result<(), CompileError> {
         cpp_output
     };
 
-    if let Some(ref out_path) = cli.output {
-        fs::write(out_path, &final_output)?;
-        eprintln!("Generated: {}", out_path.display());
+    Ok(Some(final_output))
+}
+
+fn run_nova(
+    input: &PathBuf,
+    standalone: bool,
+    lib_paths: &[PathBuf],
+    cxx: &str,
+    keep_temp: bool,
+) -> Result<(), CompileError> {
+    let source = fs::read_to_string(input)?;
+    let module_name = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("main");
+
+    let cpp_output = build_cpp(input, &source, standalone, lib_paths, module_name, false, false)?
+        .ok_or_else(|| CompileError::Generic("Unexpected check-only in run mode".into()))?;
+
+    // Write to temp C++ file
+    let tmp_dir = std::env::temp_dir();
+    let cpp_path = if keep_temp {
+        input.with_extension("gen.cpp")
     } else {
-        println!("{}", final_output);
+        tmp_dir.join(format!("nova_{}.cpp", module_name))
+    };
+    fs::write(&cpp_path, &cpp_output)?;
+
+    let bin_path = if keep_temp {
+        input.with_extension("")
+    } else {
+        tmp_dir.join(format!("nova_{}", module_name))
+    };
+
+    // Compile with C++ compiler
+    eprintln!("Compiling {} with {}...", input.display(), cxx);
+    let compile_status = Command::new(cxx)
+        .arg("-std=c++20")
+        .arg("-w")
+        .arg("-x").arg("c++")
+        .arg(&cpp_path)
+        .arg("-o").arg(&bin_path)
+        .status()
+        .map_err(|e| CompileError::Generic(format!("Failed to run {}: {}", cxx, e)))?;
+
+    if !compile_status.success() {
+        if !keep_temp {
+            let _ = fs::remove_file(&cpp_path);
+            let _ = fs::remove_file(&bin_path);
+        }
+        return Err(CompileError::Generic("C++ compilation failed".into()));
+    }
+
+    // Run the binary
+    eprintln!("Running {}...", bin_path.display());
+    let run_status = Command::new(&bin_path)
+        .status()
+        .map_err(|e| CompileError::Generic(format!("Failed to run binary: {}", e)))?;
+
+    if !run_status.success() {
+        // Cleanup
+        if !keep_temp {
+            let _ = fs::remove_file(&cpp_path);
+            let _ = fs::remove_file(&bin_path);
+        }
+        std::process::exit(run_status.code().unwrap_or(1));
+    }
+
+    // Cleanup temp files
+    if !keep_temp {
+        let _ = fs::remove_file(&cpp_path);
+        let _ = fs::remove_file(&bin_path);
+    }
+
+    Ok(())
+}
+
+fn run(cli: &Cli) -> Result<(), CompileError> {
+    let input = cli.input.as_ref().unwrap();
+    let source = fs::read_to_string(input)?;
+    let module_name = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("main")
+        .to_string();
+
+    let cpp_output = build_cpp(
+        input, &source, cli.standalone, &cli.lib_paths, &module_name,
+        cli.print_ast, cli.check_only,
+    )?;
+
+    // check_only returns None (already printed "Type checking passed ✓")
+    if let Some(output) = cpp_output {
+        if let Some(ref out_path) = cli.output {
+            fs::write(out_path, &output)?;
+            eprintln!("Generated: {}", out_path.display());
+        } else {
+            println!("{}", output);
+        }
     }
 
     Ok(())
