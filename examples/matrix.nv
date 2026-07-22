@@ -11,7 +11,7 @@ struct HotVector { idx: Int, sz: Int }
 @debug(HotVector)
 impl Matrix for HotVector { func size(h: HotVector) -> Int { h.sz } }
 
-@debug(Matrix)  // ← what happens?
+@debug(Matrix)  // generic fallback for Matrix values whose concrete type has no Debug impl
 
 func inner(a: Matrix, b: Matrix) -> Int { a.size() * b.size() }
 func inner(a: Matrix, b: HotVector) -> Int { a.size() + b.idx }
@@ -24,10 +24,10 @@ func make_matrix(kind: Int) -> Matrix {
 
 func main() -> Int {
     let d = Dense { sz: 42 };
-    d.debug();  // calls debug(Dense) ✓
+    d.debug();  // static: calls debug(Dense) ✓
 
     let a = make_matrix(0);
-    a.debug();  // calls debug(Matrix) — generic, ignores concrete type!
+    a.debug();  // dynamic: dispatches on runtime type → debug(Dense) ✓
 
     let b = make_matrix(1);
     let r = dot(a, b);
