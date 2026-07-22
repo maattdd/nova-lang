@@ -1,10 +1,12 @@
 // Test named parameters
+@import("std/test")
+
 func greet(name: String, ~greeting: String) -> String {
     return greeting + ", " + name
 }
 
 func main() -> Int {
     let msg = greet("World", ~greeting: "Hello");
-    @cpp { std::cout << msg << std::endl; }
+    assert_eq("named arg reorder", msg, "Hello, World");
     return 0
 }

@@ -11,6 +11,8 @@
 #include <memory>
 #include <stdexcept>
 #include <iostream>
+#include <type_traits>
+#include <utility>
 
 namespace nova {
 
@@ -37,69 +39,6 @@ private:
     bool marked_ = false;
 };
 
-// ─── GC pointer (smart pointer for @T) ──────────────────────────────────────
-
-template<typename T>
-class gc_ptr {
-    static_assert(std::is_base_of_v<GCObject, T>, "gc_ptr requires GCObject base");
-
-public:
-    gc_ptr() : ptr_(nullptr) {}
-    gc_ptr(std::nullptr_t) : ptr_(nullptr) {}
-    
-    explicit gc_ptr(T* ptr) : ptr_(ptr) {
-        if (ptr_) GC::instance().register_ptr(this);
-    }
-
-    ~gc_ptr() {
-        if (ptr_) GC::instance().unregister_ptr(this);
-    }
-
-    gc_ptr(const gc_ptr& other) : ptr_(other.ptr_) {
-        if (ptr_) GC::instance().register_ptr(this);
-    }
-
-    gc_ptr(gc_ptr&& other) noexcept : ptr_(other.ptr_) {
-        other.ptr_ = nullptr;
-        if (ptr_) {
-            GC::instance().unregister_ptr(&other);
-            GC::instance().register_ptr(this);
-        }
-    }
-
-    gc_ptr& operator=(const gc_ptr& other) {
-        if (this != &other) {
-            if (ptr_) GC::instance().unregister_ptr(this);
-            ptr_ = other.ptr_;
-            if (ptr_) GC::instance().register_ptr(this);
-        }
-        return *this;
-    }
-
-    gc_ptr& operator=(gc_ptr&& other) noexcept {
-        if (this != &other) {
-            if (ptr_) GC::instance().unregister_ptr(this);
-            ptr_ = other.ptr_;
-            other.ptr_ = nullptr;
-            if (ptr_) GC::instance().register_ptr(this);
-            GC::instance().unregister_ptr(&other);
-        }
-        return *this;
-    }
-
-    T* operator->() const { return ptr_; }
-    T& operator*() const { return *ptr_; }
-    T* get() const { return ptr_; }
-    
-    explicit operator bool() const { return ptr_ != nullptr; }
-    bool operator==(std::nullptr_t) const { return ptr_ == nullptr; }
-    bool operator!=(std::nullptr_t) const { return ptr_ != nullptr; }
-
-private:
-    template<typename U> friend class gc_ptr;
-    T* ptr_;
-};
-
 // ─── GC class ────────────────────────────────────────────────────────────────
 
 class GC {
@@ -109,14 +48,12 @@ public:
         return gc;
     }
 
-    // Allocate a GC-managed object
-    template<typename T, typename... Args>
-    friend gc_ptr<T> gc_alloc(Args&&... args) {
-        T* ptr = new T(std::forward<Args>(args)...);
-        instance().allocated_.push_back(ptr);
-        instance().bytes_allocated_ += ptr->gc_size();
-        instance().maybe_collect();
-        return gc_ptr<T>(ptr);
+    // Track a freshly allocated object. Collection (if triggered) runs before
+    // the object is tracked, so it can never sweep the object being allocated.
+    void track(GCObject* obj) {
+        maybe_collect();
+        allocated_.push_back(obj);
+        bytes_allocated_ += obj->gc_size();
     }
 
     // Register a gc_ptr as a root
@@ -203,11 +140,77 @@ private:
     size_t bytes_allocated_ = 0;
 };
 
+// ─── GC pointer (smart pointer for @T) ──────────────────────────────────────
+// Defined after GC so its members can use GC::instance().
+
+template<typename T>
+class gc_ptr {
+    static_assert(std::is_base_of_v<GCObject, T>, "gc_ptr requires GCObject base");
+
+public:
+    gc_ptr() : ptr_(nullptr) {}
+    gc_ptr(std::nullptr_t) : ptr_(nullptr) {}
+
+    explicit gc_ptr(T* ptr) : ptr_(ptr) {
+        if (ptr_) GC::instance().register_ptr(this);
+    }
+
+    ~gc_ptr() {
+        if (ptr_) GC::instance().unregister_ptr(this);
+    }
+
+    gc_ptr(const gc_ptr& other) : ptr_(other.ptr_) {
+        if (ptr_) GC::instance().register_ptr(this);
+    }
+
+    gc_ptr(gc_ptr&& other) noexcept : ptr_(other.ptr_) {
+        other.ptr_ = nullptr;
+        if (ptr_) {
+            GC::instance().unregister_ptr(&other);
+            GC::instance().register_ptr(this);
+        }
+    }
+
+    gc_ptr& operator=(const gc_ptr& other) {
+        if (this != &other) {
+            if (ptr_) GC::instance().unregister_ptr(this);
+            ptr_ = other.ptr_;
+            if (ptr_) GC::instance().register_ptr(this);
+        }
+        return *this;
+    }
+
+    gc_ptr& operator=(gc_ptr&& other) noexcept {
+        if (this != &other) {
+            if (ptr_) GC::instance().unregister_ptr(this);
+            ptr_ = other.ptr_;
+            other.ptr_ = nullptr;
+            if (ptr_) GC::instance().register_ptr(this);
+            GC::instance().unregister_ptr(&other);
+        }
+        return *this;
+    }
+
+    T* operator->() const { return ptr_; }
+    T& operator*() const { return *ptr_; }
+    T* get() const { return ptr_; }
+
+    explicit operator bool() const { return ptr_ != nullptr; }
+    bool operator==(std::nullptr_t) const { return ptr_ == nullptr; }
+    bool operator!=(std::nullptr_t) const { return ptr_ != nullptr; }
+
+private:
+    template<typename U> friend class gc_ptr;
+    T* ptr_;
+};
+
 // ─── Helper: alloc with constructor args ────────────────────────────────────
 
 template<typename T, typename... Args>
 gc_ptr<T> gc_alloc(Args&&... args) {
-    return GC::gc_alloc<T>(std::forward<Args>(args)...);
+    T* ptr = new T(std::forward<Args>(args)...);
+    GC::instance().track(ptr);
+    return gc_ptr<T>(ptr);
 }
 
 // ─── Built-in GC-managed string ─────────────────────────────────────────────

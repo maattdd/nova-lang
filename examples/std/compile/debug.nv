@@ -1,27 +1,65 @@
 // std/compile/debug.nv — trait Debug + @debug generates impl blocks
+//
+// @debug(T) generates:
+//   func debug_fmt(self: T, indent: Int)   — multiline pretty-printer;
+//                                            struct fields recurse with indent + 1
+//   impl Debug for T { func debug(self: T) { debug_fmt(self, 0) } }
+//
+// Output format:
+//   Rect {
+//     top_left: Point {
+//       x: 0
+//     }
+//   }
+
 trait Debug {
     func debug(self: Debug);
+}
+
+pub func print_indent(n: Int) {
+    var i = 0;
+    while i < n {
+        print("  ");
+        i = i + 1;
+    }
 }
 
 macro debug(type_name) {
     let def = lookup_type(type_name);
     let fields = struct_fields(def);
 
-    let stmts = list(make_call("print", list(make_string(type_name + " {"))));
+    let stmts = list(make_call("println", list(make_string(type_name + " {"))));
     for field in fields {
         let fname = field[0];
         let ftype = field[1];
-        let val_field = make_field(make_ident("self"), fname);
+        stmts = list_push(stmts, make_call("print_indent",
+            list(make_binary("+", make_ident("indent"), make_int(1)))));
         stmts = list_push(stmts, make_call("print", list(make_string(fname + ": "))));
+        let val_field = make_field(make_ident("self"), fname);
         if type_exists(ftype) {
-            stmts = list_push(stmts, make_call("debug", list(val_field)));
+            stmts = list_push(stmts, make_call("debug_fmt",
+                list(val_field, make_binary("+", make_ident("indent"), make_int(1)))));
         } else {
             stmts = list_push(stmts, make_call("print", list(val_field)));
+            stmts = list_push(stmts, make_call("println", list(make_string(""))));
         }
     }
-    stmts = list_push(stmts, make_call("print", list(make_string("}"))));
+    stmts = list_push(stmts, make_call("print_indent", list(make_ident("indent"))));
+    stmts = list_push(stmts, make_call("println", list(make_string("}"))));
 
-    let method = make_function("debug", list(list("self", type_name)), "void", make_block(stmts));
+    let fmt_fn = make_function(
+        "debug_fmt",
+        list(list("self", type_name), list("indent", "Int")),
+        "void",
+        make_block(stmts)
+    );
+
+    let method = make_function(
+        "debug",
+        list(list("self", type_name)),
+        "void",
+        make_block(list(make_call("debug_fmt", list(make_ident("self"), make_int(0)))))
+    );
     let impl_block = make_impl("Debug", type_name, list(method));
-    splice(impl_block)
+    splice(list(impl_block, fmt_fn))
 }

@@ -62,6 +62,7 @@ impl MacroExpander {
 
         // Second pass: expand macro calls in all items
         let mut expanded_items = Vec::new();
+        let mut spliced_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
         for item in module.items.drain(..) {
             match item {
                 Item::Macro(_) => {
@@ -76,7 +77,15 @@ impl MacroExpander {
                             self.macros.insert(mdef.name.clone(), mdef.clone());
                         }
                     }
-                    expanded_items.extend(expanded);
+                    // Skip exact re-splices (e.g. an item imported both by a
+                    // whole-module @import and a later selective @import)
+                    for item in expanded {
+                        let sig = Self::item_signature(&item);
+                        if let Some(sig) = sig {
+                            if !spliced_sigs.insert(sig) { continue; }
+                        }
+                        expanded_items.push(item);
+                    }
                 }
                 Item::Function(mut func) => {
                     self.expand_in_function(&mut func)?;
@@ -96,6 +105,21 @@ impl MacroExpander {
 
         module.items = expanded_items;
         Ok(())
+    }
+
+    /// Identity of a spliced item for dedup: kind + name + (for functions) param types.
+    fn item_signature(item: &Item) -> Option<String> {
+        match item {
+            Item::Function(f) => {
+                let params: Vec<String> = f.params.iter().map(|p| p.ty.to_string()).collect();
+                Some(format!("fn {}({})", f.name, params.join(",")))
+            }
+            Item::Struct(s) => Some(format!("struct {}", s.name)),
+            Item::Enum(e) => Some(format!("enum {}", e.name)),
+            Item::TypeAlias(t) => Some(format!("type {}", t.name)),
+            Item::VarDecl(v) => Some(format!("var {}", v.name)),
+            _ => None,
+        }
     }
 
     fn expand_in_function(&mut self, func: &mut Function) -> Result<(), CompileError> {
@@ -122,12 +146,13 @@ impl MacroExpander {
     fn expand_module_macro(&mut self, call: &MacroCallItem) -> Result<Vec<Item>, CompileError> {
         // Built-in: @import("module.path", ...) — kept for bootstrap
         if call.name == "import" {
-            // Check if there's a user-defined import macro first
-            if self.macros.contains_key("import") {
-                // Use the userland macro
-                let macro_def = self.macros.get("import").cloned().unwrap();
-                let result = self.eval_macro(&macro_def, &call.args, call.span)?;
-                return self.extract_result_items(result);
+            // Use the userland macro when its signature fits (plain imports);
+            // selective/renaming imports are handled by the built-in.
+            if let Some(macro_def) = self.macros.get("import").cloned() {
+                if macro_def.params.len() == call.args.len() {
+                    let result = self.eval_macro(&macro_def, &call.args, call.span)?;
+                    return self.extract_result_items(result);
+                }
             }
             // Fallback to built-in import
             return self.import_macro.eval(&call.args, call.span);

@@ -1,5 +1,6 @@
 // UFCS demo — p.to_json() with print
 @import("std/compile/json")
+@import("std/test")
 
 struct Point {
     x: Float,
@@ -13,7 +14,7 @@ func main() -> Int {
 
     // UFCS: p.to_json() calls to_json(p)
     let json = p.to_json();
-    print(json);
+    assert_eq("to_json", json, "{\"x\":3.000000,\"y\":2.000000}");
 
     return 0
 }

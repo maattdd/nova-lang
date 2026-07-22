@@ -719,6 +719,25 @@ impl Parser {
                 Ok(Expr::new(ExprKind::NilLiteral, start))
             }
 
+            // Quote — must come before the keyword-as-ident catch-all below,
+            // which would otherwise swallow `quote` as an identifier.
+            TokenKind::Quote => self.parse_quote_expr(),
+
+            // .case or .case(expr) — enum constructor, mirroring pattern syntax
+            TokenKind::Dot => {
+                self.advance();
+                let case = self.parse_ident()?;
+                let arg = if matches!(self.peek_kind(), TokenKind::LParen) {
+                    self.advance();
+                    let inner = self.parse_expr()?;
+                    let _ = self.consume(TokenKind::RParen);
+                    Some(Box::new(inner))
+                } else {
+                    None
+                };
+                Ok(Expr::new(ExprKind::EnumCtor { path: vec![], case, arg }, start))
+            }
+
             // Identifiers and paths (keywords usable as idents in expressions)
             _ if self.is_ident_or_keyword() => {
                 let name = self.consume_ident_or_keyword();
@@ -919,12 +938,10 @@ impl Parser {
                 Ok(Expr::let_binding(&name, ty, value, is_mut, start))
             }
 
-            // Quote
-            TokenKind::Quote => self.parse_quote_expr(),
-
             TokenKind::Func => {
-                self.advance();
-                Ok(Expr::ident("func", start))
+                // Function definition in expression position (e.g. inside quote blocks)
+                let func = self.parse_function(false)?;
+                Ok(Expr::new(ExprKind::FuncDef(func), start))
             }
 
             TokenKind::Tilde => {

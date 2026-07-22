@@ -8,6 +8,9 @@ use std::collections::HashMap;
 pub struct TypeChecker {
     types: HashMap<String, TypeInfo>,
     functions: HashMap<String, Vec<Type>>,
+    // Parallel to `functions`: parameter lists (names + namedness) per overload,
+    // used to resolve ~name: value arguments. None for builtins.
+    fn_params: HashMap<String, Vec<Option<Vec<Param>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +35,12 @@ impl TypeChecker {
         functions.insert("println".into(), vec![ext.clone()]);
         functions.insert("print_int".into(), vec![ext]);
 
-        Self { types, functions }
+        let mut fn_params: HashMap<String, Vec<Option<Vec<Param>>>> = HashMap::new();
+        for name in ["print", "println", "print_int"] {
+            fn_params.insert(name.into(), vec![None]);
+        }
+
+        Self { types, functions, fn_params }
     }
 
     pub fn register_types(&mut self, module: &Module) {
@@ -58,6 +66,7 @@ impl TypeChecker {
                             ret: Box::new(method.return_type.clone()),
                         });
                         self.functions.entry(method.name.clone()).or_default().push(ft);
+                        self.fn_params.entry(method.name.clone()).or_default().push(Some(method.params.clone()));
                     }
                 }
                 Item::Impl(imp) => {
@@ -67,6 +76,7 @@ impl TypeChecker {
                             ret: Box::new(method.return_type.clone()),
                         });
                         self.functions.entry(method.name.clone()).or_default().push(ft);
+                        self.fn_params.entry(method.name.clone()).or_default().push(Some(method.params.clone()));
                     }
                 }
                 Item::Function(f) => {
@@ -75,6 +85,7 @@ impl TypeChecker {
                         ret: Box::new(f.return_type.clone()),
                     });
                     self.functions.entry(f.name.clone()).or_default().push(ft);
+                    self.fn_params.entry(f.name.clone()).or_default().push(Some(f.params.clone()));
                 }
                 _ => {}
             }
@@ -153,6 +164,23 @@ impl TypeChecker {
             ExprKind::Return(Some(e)) => self.check_expr_with_env(e, env, res),
             ExprKind::Return(None) => Ok(Type::Unit),
 
+            ExprKind::NamedArg { value, .. } => self.check_expr_with_env(value, env, res),
+
+            ExprKind::EnumCtor { path, case, arg } => {
+                if let Some(a) = arg { self.check_expr_with_env(a, env, res)?; }
+                // Explicit path wins; otherwise resolve the enum by case name.
+                let ename = path.last().cloned().or_else(|| {
+                    self.types.iter().find_map(|(n, ti)| match ti {
+                        TypeInfo::Enum(e) if e.cases.iter().any(|c| &c.name == case) => Some(n.clone()),
+                        _ => None,
+                    })
+                });
+                match ename {
+                    Some(n) => Ok(Type::path(&n)),
+                    None => Err(CompileError::type_err(format!("Unknown enum case '.{}'", case), expr.span)),
+                }
+            }
+
             ExprKind::Binary { op, left, right } => {
                 let lt = self.check_expr_with_env(left, env, res)?;
                 let rt = self.check_expr_with_env(right, env, res)?;
@@ -196,7 +224,8 @@ impl TypeChecker {
                         let mut best: Option<(usize, i32)> = None;
                         for (i, ft) in candidates.iter().enumerate() {
                             if let Type::Function(ref sig) = ft {
-                                if let Some(s) = self.match_score(sig, &arg_types) {
+                                let params = self.fn_params.get(&name).and_then(|v| v.get(i)).and_then(|p| p.as_ref());
+                                if let Some(s) = self.match_score(sig, params, args, &arg_types) {
                                     match best {
                                         None => best = Some((i, s)),
                                         Some((_, ps)) if s < ps => best = Some((i, s)),
@@ -213,6 +242,13 @@ impl TypeChecker {
                         }
                         return Err(CompileError::type_err(format!("No matching overload for '{}'", name), expr.span));
                     }
+                    // Not a known function: a variable holding a callable is fine,
+                    // anything else is an undefined function.
+                    if env.contains_key(&name) {
+                        for a in args { self.check_expr_with_env(a, env, res)?; }
+                        return Ok(Type::Unit);
+                    }
+                    return Err(CompileError::type_err(format!("Undefined function: '{}'", name), expr.span));
                 }
                 Ok(Type::Unit)
             }
@@ -317,11 +353,17 @@ impl TypeChecker {
         self.check_expr(expr, &HashMap::new(), res)
     }
 
-    fn match_score(&self, sig: &FunctionType, arg_types: &[Type]) -> Option<i32> {
-        if sig.params.is_empty() { return Some(0); }
+    fn match_score(&self, sig: &FunctionType, params: Option<&Vec<Param>>, args: &[Expr], arg_types: &[Type]) -> Option<i32> {
+        if sig.params.is_empty() { return Some(0); } // variadic builtins
         if sig.params.len() != arg_types.len() { return None; }
-        for (pt, at) in sig.params.iter().zip(arg_types.iter()) {
-            if !self.types_equal(pt, at) { return None; }
+        let has_named = args.iter().any(|a| matches!(a.kind, ExprKind::NamedArg { .. }));
+        let slot_args: Vec<usize> = if has_named {
+            assign_arg_slots(params?, args)?
+        } else {
+            (0..args.len()).collect()
+        };
+        for (slot, &ai) in slot_args.iter().enumerate() {
+            if !self.types_equal(&sig.params[slot], &arg_types[ai]) { return None; }
         }
         Some(0)
     }
@@ -352,4 +394,28 @@ impl TypeChecker {
 
 fn is_unit_type(ty: &Type) -> bool {
     matches!(ty, Type::Unit)
+}
+
+/// Map each parameter slot to an argument index, resolving ~name: value args
+/// by parameter name and filling remaining slots positionally.
+pub fn assign_arg_slots(params: &[Param], args: &[Expr]) -> Option<Vec<usize>> {
+    if params.len() != args.len() { return None; }
+    let mut slots: Vec<Option<usize>> = vec![None; params.len()];
+    let mut next_positional = 0usize;
+    for (ai, arg) in args.iter().enumerate() {
+        match &arg.kind {
+            ExprKind::NamedArg { name, .. } => {
+                let slot = params.iter().position(|p| &p.name == name)?;
+                if slots[slot].is_some() { return None; }
+                slots[slot] = Some(ai);
+            }
+            _ => {
+                while next_positional < slots.len() && slots[next_positional].is_some() { next_positional += 1; }
+                if next_positional >= slots.len() { return None; }
+                slots[next_positional] = Some(ai);
+                next_positional += 1;
+            }
+        }
+    }
+    slots.into_iter().collect()
 }

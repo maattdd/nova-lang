@@ -1,4 +1,6 @@
-// Minimal test — no external functions needed
+// Minimal test — no imports beyond the assertion helpers
+@import("std/test")
+
 func add(a: Int, b: Int) -> Int {
     return a + b
 }
@@ -6,5 +8,6 @@ func add(a: Int, b: Int) -> Int {
 func main() -> Int {
     let x: Int = 42;
     let y: Int = add(x, 10);
-    return y
+    assert_eq("add(42, 10)", y, 52);
+    return 0
 }

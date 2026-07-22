@@ -1,5 +1,8 @@
 @import("std/math")
+@import("std/test")
+
 func main() -> Int {
     let x = square(5);
-    return x
+    assert_eq("square(5)", x, 25);
+    return 0
 }

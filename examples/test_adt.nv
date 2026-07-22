@@ -1,0 +1,54 @@
+// Algebraic Data Types & Pattern Matching in Nova
+@import("std/test")
+
+// Non-generic ADT with payloads
+enum Shape {
+    case circle(Int),   // radius
+    case square(Int),   // side
+    case dot
+}
+
+func area(s: Shape) -> Int {
+    match s {
+        case .circle(r) => 3 * r * r
+        case .square(side) => side * side
+        case .dot => 0
+    }
+}
+
+// Generic ADT
+enum Option[T] {
+    case some(T),
+    case none
+}
+
+func find_even(x: Int) -> Option[Int] {
+    if x % 2 == 0 { return .some(x) }
+    else { return .none }
+}
+
+func get_or_default(opt: Option[Int], default: Int) -> Int {
+    match opt {
+        case .some(val) => val
+        case .none => default
+    }
+}
+
+func main() -> Int {
+    // Construction + dispatch on the matched case
+    let c = .circle(3);
+    assert_eq("area circle", area(c), 27);
+    assert_eq("area square", area(.square(4)), 16);
+    assert_eq("area dot", area(.dot), 0);
+
+    // Generic enum flowing through functions
+    let a = find_even(10);
+    let b = find_even(7);
+    assert_eq("find_even some", get_or_default(a, 0), 10);
+    assert_eq("find_even none", get_or_default(b, 0), 0);
+
+    // Payload-less constructor adopting its declared type
+    let e: Option[Int] = .none;
+    assert_eq("none default", get_or_default(e, 5), 5);
+    return 0
+}

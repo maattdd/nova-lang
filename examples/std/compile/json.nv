@@ -3,23 +3,30 @@
 //       std/compile/ast (make_string, make_binary, make_field,
 //       make_ident, make_function, make_return, to_string, list, splice)
 
+trait Jsonable {
+    func to_json(self: Jsonable) -> String;
+}
+
 macro json(type_name) {
     let def = lookup_type(type_name);
     let fields = struct_fields(def);
-    
+
     let result = make_string("{");
+    let sep = "";
     for field in fields {
         let fname = field[0];
-        result = make_binary("+", result, make_string("\"" + fname + "\":"));
-        result = make_binary("+", result, to_string(make_field(make_ident("val"), fname)));
+        result = make_binary("+", result, make_string(sep + "\"" + fname + "\":"));
+        result = make_binary("+", result, to_string(make_field(make_ident("self"), fname)));
+        sep = ",";
     }
     result = make_binary("+", result, make_string("}"));
 
-    let fn_def = make_function(
+    let method = make_function(
         "to_json",
-        list(list("val", type_name)),
+        list(list("self", type_name)),
         "String",
         make_return(result)
     );
-    splice(fn_def)
+    let impl_block = make_impl("Jsonable", type_name, list(method));
+    splice(impl_block)
 }

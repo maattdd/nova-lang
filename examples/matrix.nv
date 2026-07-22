@@ -1,5 +1,6 @@
 // matrix.nv — Multiple dispatch with Debug trait
 @import("std/compile/debug")
+@import("std/test")
 
 trait Matrix { func size(m: Matrix) -> Int }
 
@@ -29,8 +30,10 @@ func main() -> Int {
     let a = make_matrix(0);
     a.debug();  // dynamic: dispatches on runtime type → debug(Dense) ✓
 
+    assert_eq("size via vtable", a.size(), 5);
+
     let b = make_matrix(1);
     let r = dot(a, b);
-    print_int(r);
+    assert_eq("dot picks inner(Matrix, HotVector)", r, 8);
     return 0
 }

@@ -9,10 +9,15 @@
 // Import just one item
 @import("std.math", cube)
 
+@import("std/test")
+
 func main() -> Int {
     let a = square(3);   // 9 — imported from std.math
     let b = sq(4);       // 16 — renamed import
     let c = cube(2);     // 8 — explicitly imported
 
-    return a + b + c     // 33
+    assert_eq("square(3)", a, 9);
+    assert_eq("sq(4)", b, 16);
+    assert_eq("cube(2)", c, 8);
+    return 0
 }

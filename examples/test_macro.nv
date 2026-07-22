@@ -1,4 +1,5 @@
 // Test macro expansion
+@import("std/test")
 macro make_adder(name, amount) {
     quote {
         func $name(x: Int) -> Int {
@@ -13,5 +14,7 @@ macro make_adder(name, amount) {
 func main() -> Int {
     let a = add_five(10);
     let b = add_ten(10);
-    return a + b
+    assert_eq("add_five(10)", a, 15);
+    assert_eq("add_ten(10)", b, 20);
+    return 0
 }

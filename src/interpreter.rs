@@ -241,6 +241,18 @@ impl Interpreter {
             "splice" => match args.first() {
                 Some(Value::Items(items)) => Ok(Value::Items(items.clone())),
                 Some(Value::Item(item)) => Ok(Value::Items(vec![item.clone()])),
+                // splice(list(item1, item2, ...)) — splice several items at once
+                Some(Value::List(vals)) => {
+                    let mut items = Vec::new();
+                    for v in vals {
+                        match v {
+                            Value::Item(item) => items.push(item.clone()),
+                            Value::Items(more) => items.extend(more.iter().cloned()),
+                            _ => return Err(CompileError::macro_err("splice list may only contain items", span)),
+                        }
+                    }
+                    Ok(Value::Items(items))
+                }
                 _ => Err(CompileError::macro_err("splice expects items or an item", span)),
             },
             "error" => {
@@ -486,12 +498,20 @@ impl Interpreter {
     }
 
     fn read_file(&self, path: &str) -> Result<String, CompileError> {
+        // "std.math.nv" and "std/math.nv" both refer to std/math.nv
+        let dotted = path.strip_suffix(".nv")
+            .map(|stem| format!("{}.nv", stem.replace('.', "/")));
+        let candidates: Vec<&str> = std::iter::once(path)
+            .chain(dotted.as_deref())
+            .collect();
         for sp in &self.search_paths {
-            let full = sp.join(path);
-            if full.exists() {
-                return fs::read_to_string(&full).map_err(|e| {
-                    CompileError::Generic(format!("Cannot read '{}': {}", path, e))
-                });
+            for cand in &candidates {
+                let full = sp.join(cand);
+                if full.exists() {
+                    return fs::read_to_string(&full).map_err(|e| {
+                        CompileError::Generic(format!("Cannot read '{}': {}", cand, e))
+                    });
+                }
             }
         }
         Err(CompileError::macro_err(format!("File not found: '{}'", path), Span::zero()))

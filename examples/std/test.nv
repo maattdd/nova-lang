@@ -1,0 +1,34 @@
+// std/test.nv — minimal assertion helpers for example programs.
+// Failed assertions print a FAIL line and terminate with a nonzero exit,
+// so any test harness watching the exit code catches them.
+
+pub func assert_eq(name: String, actual: Int, expected: Int) {
+    if actual == expected {
+        println("ok " + name);
+    } else {
+        print("FAIL " + name + ": got ");
+        print(actual);
+        print(" expected ");
+        print(expected);
+        println("");
+        @cpp { std::exit(1); }
+    }
+}
+
+pub func assert_eq(name: String, actual: String, expected: String) {
+    if actual == expected {
+        println("ok " + name);
+    } else {
+        println("FAIL " + name + ": got \"" + actual + "\" expected \"" + expected + "\"");
+        @cpp { std::exit(1); }
+    }
+}
+
+pub func assert_true(name: String, cond: Bool) {
+    if cond {
+        println("ok " + name);
+    } else {
+        println("FAIL " + name);
+        @cpp { std::exit(1); }
+    }
+}

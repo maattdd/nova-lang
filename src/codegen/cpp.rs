@@ -1,10 +1,10 @@
 use crate::ast::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// One overload of a dispatched function (free function or impl method).
+/// One overload of a function (free function or impl method).
 #[derive(Debug, Clone)]
 struct Overload {
-    params: Vec<Type>,
+    params: Vec<Param>,
     ret: Type,
 }
 
@@ -31,18 +31,24 @@ pub struct CppGenerator {
     dispatch: BTreeMap<String, DispatchInfo>,
     return_trait: Option<String>,
     trait_names: HashSet<String>,
-    trait_methods: HashSet<String>,
     // trait name → concrete impl targets, in declaration order
     trait_impls: BTreeMap<String, Vec<String>>,
     type_ids: HashMap<String, u32>,
+    // every overload set, for named-argument reordering
+    fn_sigs: HashMap<String, Vec<Overload>>,
+    // enum case name → (enum name, tag index, has payload, enum is generic)
+    enum_cases: HashMap<String, (String, usize, bool, bool)>,
+    // structs allocated via @T — they get a nova::GCObject base
+    gc_structs: HashSet<String>,
 }
 
 impl CppGenerator {
     pub fn new() -> Self {
         Self {
             output: String::new(), indent: 0, dispatch: BTreeMap::new(),
-            return_trait: None, trait_names: HashSet::new(), trait_methods: HashSet::new(),
+            return_trait: None, trait_names: HashSet::new(),
             trait_impls: BTreeMap::new(), type_ids: HashMap::new(),
+            fn_sigs: HashMap::new(), enum_cases: HashMap::new(), gc_structs: HashSet::new(),
         }
     }
 
@@ -73,13 +79,16 @@ impl CppGenerator {
         let add = |f: &Function, names: &mut Vec<String>, sets: &mut HashMap<String, Vec<Overload>>| {
             if !sets.contains_key(&f.name) { names.push(f.name.clone()); }
             sets.entry(f.name.clone()).or_default().push(Overload {
-                params: f.params.iter().map(|p| p.ty.clone()).collect(),
+                params: f.params.clone(),
                 ret: f.return_type.clone(),
             });
         };
         for item in &module.items {
             match item {
-                Item::Function(f) => add(f, &mut names, &mut sets),
+                Item::Function(f) => {
+                    add(f, &mut names, &mut sets);
+                    self.scan_gc_function(f);
+                }
                 Item::Impl(imp) => {
                     let target = match &imp.target_type {
                         Type::Path(p) => p.segments.last().map(|s| s.name.as_str()).unwrap_or("unknown"),
@@ -90,12 +99,19 @@ impl CppGenerator {
                         let v = self.trait_impls.entry(imp.trait_name.clone()).or_default();
                         if !v.iter().any(|t| t == target) { v.push(target.to_string()); }
                     }
-                    for m in &imp.methods { add(m, &mut names, &mut sets); }
-                }
-                Item::Trait(t) => {
-                    if t.name != "Debug" {
-                        for m in &t.methods { self.trait_methods.insert(m.name.clone()); }
+                    for m in &imp.methods {
+                        add(m, &mut names, &mut sets);
+                        self.scan_gc_function(m);
                     }
+                }
+                Item::Enum(e) => {
+                    for (i, case) in e.cases.iter().enumerate() {
+                        self.enum_cases.insert(case.name.clone(),
+                            (e.name.clone(), i, case.payload.is_some(), !e.generics.is_empty()));
+                    }
+                }
+                Item::Struct(s) => {
+                    for f in &s.fields { self.note_gc_type(&f.ty); }
                 }
                 _ => {}
             }
@@ -114,7 +130,7 @@ impl CppGenerator {
             let mut ok = true;
             for i in 0..arity {
                 let mut traits: Vec<&str> = ovs.iter()
-                    .filter_map(|o| Self::last_name(&o.params[i]))
+                    .filter_map(|o| Self::last_name(&o.params[i].ty))
                     .filter(|n| self.trait_names.contains(*n))
                     .collect();
                 traits.dedup();
@@ -131,21 +147,77 @@ impl CppGenerator {
             if dispatch_positions.iter().any(|t| self.trait_impls.get(*t).map_or(true, |v| v.is_empty())) { continue; }
             // Fixed positions must have identical types across overloads.
             let fixed_ok = (0..arity).all(|i| positions[i].is_some() ||
-                ovs.iter().all(|o| self.gen_type(&o.params[i]) == self.gen_type(&ovs[0].params[i])));
+                ovs.iter().all(|o| self.gen_type(&o.params[i].ty) == self.gen_type(&ovs[0].params[i].ty)));
             if !fixed_ok { continue; }
             let has_generic_fallback = ovs.iter().any(|o| positions.iter().enumerate().all(|(i, pos)| {
                 match pos {
-                    Some(t) => Self::last_name(&o.params[i]) == Some(t.as_str()),
+                    Some(t) => Self::last_name(&o.params[i].ty) == Some(t.as_str()),
                     None => true,
                 }
             }));
             self.dispatch.insert(name, DispatchInfo {
                 positions,
-                param_types: ovs[0].params.clone(),
+                param_types: ovs[0].params.iter().map(|p| p.ty.clone()).collect(),
                 ret: ovs[0].ret.clone(),
                 overloads: ovs.clone(),
                 has_generic_fallback,
             });
+        }
+        self.fn_sigs = sets;
+    }
+
+    /// Record GC usage in a function: @T types in the signature and @T{...}
+    /// allocations in the body.
+    fn scan_gc_function(&mut self, f: &Function) {
+        for p in &f.params { self.note_gc_type(&p.ty); }
+        self.note_gc_type(&f.return_type);
+        for stmt in &f.body.stmts { self.scan_gc_expr(stmt); }
+    }
+
+    fn note_gc_type(&mut self, ty: &Type) {
+        if let Type::GcRef(inner) = ty {
+            if let Some(n) = Self::last_name(inner) { self.gc_structs.insert(n.to_string()); }
+        }
+    }
+
+    fn scan_gc_expr(&mut self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::GcNew { ty, fields } => {
+                if let Some(n) = Self::last_name(ty) { self.gc_structs.insert(n.to_string()); }
+                for (_, e) in fields { self.scan_gc_expr(e); }
+            }
+            ExprKind::Let { value, .. } | ExprKind::Return(Some(value))
+            | ExprKind::Unary { expr: value, .. } | ExprKind::NamedArg { value, .. } => self.scan_gc_expr(value),
+            ExprKind::Binary { left, right, .. } | ExprKind::Assign { target: left, value: right }
+            | ExprKind::AssignOp { target: left, value: right, .. }
+            | ExprKind::Index { object: left, index: right } => {
+                self.scan_gc_expr(left); self.scan_gc_expr(right);
+            }
+            ExprKind::Call { func, args } => {
+                self.scan_gc_expr(func);
+                for a in args { self.scan_gc_expr(a); }
+            }
+            ExprKind::Field { object, .. } | ExprKind::DotAccess { object, .. } => self.scan_gc_expr(object),
+            ExprKind::Block(b) => for s in &b.stmts { self.scan_gc_expr(s); },
+            ExprKind::If { cond, then_branch, else_branch } => {
+                self.scan_gc_expr(cond);
+                for s in &then_branch.stmts { self.scan_gc_expr(s); }
+                if let Some(eb) = else_branch { for s in &eb.stmts { self.scan_gc_expr(s); } }
+            }
+            ExprKind::While { cond, body } => {
+                self.scan_gc_expr(cond);
+                for s in &body.stmts { self.scan_gc_expr(s); }
+            }
+            ExprKind::For { iter, body, .. } => {
+                self.scan_gc_expr(iter);
+                for s in &body.stmts { self.scan_gc_expr(s); }
+            }
+            ExprKind::StructLit { fields, .. } => for (_, e) in fields { self.scan_gc_expr(e); },
+            ExprKind::Match { expr: m, arms } => {
+                self.scan_gc_expr(m);
+                for arm in arms { self.scan_gc_expr(&arm.body); }
+            }
+            _ => {}
         }
     }
 
@@ -168,7 +240,7 @@ impl CppGenerator {
             let mut j = 0;
             for (i, pos) in info.positions.iter().enumerate() {
                 if let Some(trait_name) = pos {
-                    match Self::last_name(&ov.params[i]) {
+                    match Self::last_name(&ov.params[i].ty) {
                         Some(n) if n == combo[j] => score += 1,
                         Some(n) if n == trait_name => {}
                         _ => { applicable = false; break; }
@@ -217,19 +289,23 @@ impl CppGenerator {
         self.emitln("inline void nova_print_int(int n) { std::cout << n << std::endl; }");
         self.emitln("inline void nova_print(const std::string& s) { std::cout << s; }");
         self.emitln("template<typename T> void nova_print(T v) { std::cout << v; }");
+        self.emitln("inline void nova_println(const std::string& s) { std::cout << s << std::endl; }");
         self.emitln("");
     }
 
     fn emit_module(&mut self, module: &Module) {
-        // Structs and traits first: everything else references them.
+        // Structs, enums, and traits first: everything else references them.
         for item in &module.items {
             match item {
                 Item::Struct(s) => self.emit_struct(s),
+                Item::Enum(e) => self.emit_enum(e),
                 Item::Trait(t) => self.emit_trait(t),
                 _ => {}
             }
         }
-        // Dispatch declarations before impls/functions so any body can call _d_*.
+        // Forward declarations before impls/functions, so any body can call
+        // any function (or _d_* dispatcher) regardless of emission order.
+        self.emit_fn_decls();
         self.emit_dispatch_decls();
         for item in &module.items {
             if let Item::Impl(imp) = item { self.emit_impl(imp); }
@@ -239,41 +315,115 @@ impl CppGenerator {
         }
     }
 
-    /// Forward declarations for dispatched functions: all overloads (so the
-    /// static-fallback template can resolve them), a function-pointer alias,
-    /// the dynamic entry point, and a variadic template that forwards calls
-    /// with statically-concrete arguments to plain C++ overload resolution.
+    /// Forward declarations for every user function and impl-method wrapper.
+    fn emit_fn_decls(&mut self) {
+        if self.fn_sigs.is_empty() { return; }
+        self.emitln("// ─── function declarations ───");
+        let mut names: Vec<&String> = self.fn_sigs.keys().collect();
+        names.sort();
+        let mut decls = Vec::new();
+        for name in names {
+            if name == "main" { continue; }
+            for ov in &self.fn_sigs[name] {
+                let ps: Vec<String> = ov.params.iter().map(|p| self.gen_type(&p.ty)).collect();
+                decls.push(format!("{} {}({});", self.gen_type(&ov.ret), Self::safe_ident(name), ps.join(", ")));
+            }
+        }
+        for d in decls { self.emitln(&d); }
+        self.emitln("");
+    }
+
+    /// Declarations for dispatched functions: a function-pointer alias, the
+    /// dynamic entry point, and a variadic template that forwards calls with
+    /// statically-concrete arguments to plain C++ overload resolution.
     fn emit_dispatch_decls(&mut self) {
         if self.dispatch.is_empty() { return; }
         self.emitln("// ─── dynamic dispatch declarations ───");
         for (name, info) in self.dispatch.clone() {
             let ret = self.gen_type(&info.ret);
             let ptypes = self.dispatch_param_types(&info);
-            for ov in &info.overloads {
-                let ps: Vec<String> = ov.params.iter().map(|t| self.gen_type(t)).collect();
-                self.emitln(&format!("{} {}({});", self.gen_type(&ov.ret), name, ps.join(", ")));
-            }
             self.emitln(&format!("using _fn_{} = {}(*)({});", name, ret, ptypes.join(", ")));
             self.emitln(&format!("{} _d_{}({});", ret, name, ptypes.join(", ")));
             self.emitln(&format!(
                 "template<typename... Ts> auto _d_{}(Ts&&... xs) {{ return {}(std::forward<Ts>(xs)...); }}",
-                name, name
+                name, Self::safe_ident(&name)
             ));
         }
         self.emitln("");
     }
 
     fn emit_struct(&mut self, s: &Struct) {
-        self.emitln(&format!("struct {} {{", s.name));
+        let is_gc = self.gc_structs.contains(&s.name);
+        let base = if is_gc { " : public nova::GCObject" } else { "" };
+        self.emitln(&format!("struct {}{} {{", s.name, base));
         for field in &s.fields {
-            self.emitln(&format!("  {} {};", self.gen_type(&field.ty), field.name));
+            self.emitln(&format!("  {} {};", self.gen_type(&field.ty), Self::safe_ident(&field.name)));
         }
-        let args: Vec<String> = s.fields.iter().map(|f| format!("{} {}", self.gen_type(&f.ty), f.name)).collect();
-        let inits: Vec<String> = s.fields.iter().map(|f| format!("{}({})", f.name, f.name)).collect();
+        let args: Vec<String> = s.fields.iter().map(|f| format!("{} {}", self.gen_type(&f.ty), Self::safe_ident(&f.name))).collect();
+        let inits: Vec<String> = s.fields.iter().map(|f| format!("{0}({0})", Self::safe_ident(&f.name))).collect();
         if !args.is_empty() {
             self.emitln(&format!("  {}({}) : {} {{}}", s.name, args.join(", "), inits.join(", ")));
         }
+        if is_gc {
+            self.emitln("  void gc_mark(nova::GC& gc) override {");
+            for field in &s.fields {
+                if matches!(field.ty, Type::GcRef(_)) {
+                    let fname = Self::safe_ident(&field.name);
+                    self.emitln(&format!("    if ({}) gc.mark_object({}.get());", fname, fname));
+                }
+            }
+            self.emitln("  }");
+        }
         self.emitln("};");
+        self.emitln("");
+    }
+
+    /// Enums compile to a tagged struct: one member per payload case and
+    /// static constructor functions per case.
+    fn emit_enum(&mut self, e: &Enum) {
+        self.emitln(&format!("// ─── enum {} ───", e.name));
+        if !e.generics.is_empty() {
+            let tps: Vec<String> = e.generics.iter().map(|g| format!("typename {}", g.name)).collect();
+            self.emitln(&format!("template<{}>", tps.join(", ")));
+        }
+        self.emitln(&format!("struct {} {{", e.name));
+        self.emitln("  int _tag = 0;");
+        for case in &e.cases {
+            if let Some(ref payload) = case.payload {
+                self.emitln(&format!("  {} _{}{{}};", self.gen_type(payload), case.name));
+            }
+        }
+        for (tag, case) in e.cases.iter().enumerate() {
+            match &case.payload {
+                Some(payload) => self.emitln(&format!(
+                    "  static {0} {1}({2} v) {{ {0} e; e._tag = {3}; e._{4} = v; return e; }}",
+                    e.name, Self::safe_ident(&case.name), self.gen_type(payload), tag, case.name)),
+                None => self.emitln(&format!(
+                    "  static {0} {1}() {{ {0} e; e._tag = {2}; return e; }}",
+                    e.name, Self::safe_ident(&case.name), tag)),
+            }
+        }
+        self.emitln("};");
+        // Constructor helpers for generic enums: static members of a template
+        // can't deduce the instantiation, so payload cases get a deducing free
+        // function and payload-less cases get a converting tag (like nullopt).
+        if !e.generics.is_empty() {
+            let tps: Vec<String> = e.generics.iter().map(|g| format!("typename {}", g.name)).collect();
+            let targs: Vec<String> = e.generics.iter().map(|g| g.name.clone()).collect();
+            let (tps, targs) = (tps.join(", "), targs.join(", "));
+            for case in &e.cases {
+                match &case.payload {
+                    Some(payload) => self.emitln(&format!(
+                        "template<{tps}> {en}<{ta}> {en}__{c}({pt} v) {{ return {en}<{ta}>::{sc}(v); }}",
+                        tps = tps, ta = targs, en = e.name, c = case.name,
+                        pt = self.gen_type(payload), sc = Self::safe_ident(&case.name))),
+                    None => self.emitln(&format!(
+                        "struct {en}__{c}_t {{ template<{tps}> operator {en}<{ta}>() const {{ return {en}<{ta}>::{sc}(); }} }};",
+                        tps = tps, ta = targs, en = e.name, c = case.name,
+                        sc = Self::safe_ident(&case.name))),
+                }
+            }
+        }
         self.emitln("");
     }
 
@@ -283,7 +433,7 @@ impl CppGenerator {
         self.emitln("  uint32_t type_id;");
         for m in &t.methods {
             let ret = self.gen_type(&m.return_type);
-            let params: Vec<String> = m.params.iter().skip(1).map(|p| format!("{} {}", self.gen_type(&p.ty), p.name)).collect();
+            let params: Vec<String> = m.params.iter().skip(1).map(|p| format!("{} {}", self.gen_type(&p.ty), Self::safe_ident(&p.name))).collect();
             self.emitln(&format!("  {} (*{})(void*{});", ret, m.name, if params.is_empty() { "".into() } else { format!(", {}", params.join(", ")) }));
         }
         self.emitln("};");
@@ -292,11 +442,22 @@ impl CppGenerator {
         self.emitln(&format!("  {}_vtable* _vt;", t.name));
         for m in &t.methods {
             let ret = self.gen_type(&m.return_type);
-            let pn: Vec<String> = m.params.iter().skip(1).map(|p| p.name.clone()).collect();
-            let pd: Vec<String> = m.params.iter().skip(1).map(|p| format!("{} {}", self.gen_type(&p.ty), p.name)).collect();
+            let pn: Vec<String> = m.params.iter().skip(1).map(|p| Self::safe_ident(&p.name)).collect();
+            let pd: Vec<String> = m.params.iter().skip(1).map(|p| format!("{} {}", self.gen_type(&p.ty), Self::safe_ident(&p.name))).collect();
             self.emitln(&format!("  {} {}({}) {{ return _vt->{}(_ptr{}); }}", ret, m.name, pd.join(", "), m.name, if pn.is_empty() { "".into() } else { format!(", {}", pn.join(", ")) }));
         }
         self.emitln("};");
+        // Free-function overload on the fat pointer, so UFCS calls always
+        // compile to plain overloaded calls regardless of receiver type.
+        for m in &t.methods {
+            let ret = self.gen_type(&m.return_type);
+            let pn: Vec<String> = m.params.iter().skip(1).map(|p| Self::safe_ident(&p.name)).collect();
+            let pd: Vec<String> = m.params.iter().skip(1).map(|p| format!("{} {}", self.gen_type(&p.ty), Self::safe_ident(&p.name))).collect();
+            self.emitln(&format!("inline {} {}({} self{}) {{ return self.{}({}); }}",
+                ret, Self::safe_ident(&m.name), t.name,
+                if pd.is_empty() { "".into() } else { format!(", {}", pd.join(", ")) },
+                m.name, pn.join(", ")));
+        }
         self.emitln("");
     }
 
@@ -312,7 +473,7 @@ impl CppGenerator {
             let ret = self.gen_type(&method.return_type);
             // Generate impl function with concrete type (not void*)
             let impl_params: Vec<String> = method.params.iter()
-                .map(|p| format!("{} {}", self.gen_type(&p.ty), p.name)).collect();
+                .map(|p| format!("{} {}", self.gen_type(&p.ty), Self::safe_ident(&p.name))).collect();
             self.emit(&format!("inline {} {}__{}({}) {{", ret, target, method.name, impl_params.join(", ")));
             self.indent += 1;
             self.emit_block(&method.body, !matches!(method.return_type, Type::Unit) && self.gen_type(&method.return_type) != "void");
@@ -321,11 +482,11 @@ impl CppGenerator {
             // Vtable trampoline: void* → concrete
             self.emit(&format!("inline {} {}__{}_vt(void* self", ret, target, method.name));
             for p in method.params.iter().skip(1) {
-                self.emit(&format!(", {} {}", self.gen_type(&p.ty), p.name));
+                self.emit(&format!(", {} {}", self.gen_type(&p.ty), Self::safe_ident(&p.name)));
             }
             self.emit(&format!(") {{ return {}__{}(*({}*)self", target, method.name, target));
             for p in method.params.iter().skip(1) {
-                self.emit(&format!(", {}", p.name));
+                self.emit(&format!(", {}", Self::safe_ident(&p.name)));
             }
             self.emitln("); }");
         }
@@ -339,20 +500,21 @@ impl CppGenerator {
         // Generate free function wrappers for UFCS
         for method in &imp.methods {
             let ret = self.gen_type(&method.return_type);
-            let params: Vec<String> = method.params.iter().map(|p| format!("{} {}", self.gen_type(&p.ty), p.name)).collect();
-            self.emit(&format!("inline {} {}({}) {{", ret, method.name, params.join(", ")));
+            let params: Vec<String> = method.params.iter().map(|p| format!("{} {}", self.gen_type(&p.ty), Self::safe_ident(&p.name))).collect();
+            self.emit(&format!("inline {} {}({}) {{", ret, Self::safe_ident(&method.name), params.join(", ")));
             self.emit(&format!(" return {}__{}(", target, method.name));
-            let args: Vec<String> = method.params.iter().map(|p| p.name.clone()).collect();
+            let args: Vec<String> = method.params.iter().map(|p| Self::safe_ident(&p.name)).collect();
             self.emit(&format!("{}); }}", args.join(", ")));
         }
         self.emitln("");
     }
 
     fn emit_function(&mut self, func: &Function) {
-        self.return_trait = self.trait_name(&func.return_type);
+        self.return_trait = self.trait_name(&func.return_type)
+            .filter(|n| self.trait_names.contains(n));
         let ret = self.gen_type(&func.return_type);
-        let params: Vec<String> = func.params.iter().map(|p| format!("{} {}", self.gen_type(&p.ty), p.name)).collect();
-        self.emitln(&format!("{} {}({}) {{", ret, func.name, params.join(", ")));
+        let params: Vec<String> = func.params.iter().map(|p| format!("{} {}", self.gen_type(&p.ty), Self::safe_ident(&p.name))).collect();
+        self.emitln(&format!("{} {}({}) {{", ret, Self::safe_ident(&func.name), params.join(", ")));
         self.indent += 1;
         self.emit_block(&func.body, !matches!(func.return_type, Type::Unit) && self.gen_type(&func.return_type) != "void");
         self.indent -= 1;
@@ -374,8 +536,9 @@ impl CppGenerator {
                 self.emitln(&format!("return {};", v));
             }
             ExprKind::Return(None) => self.emitln("return;"),
-            ExprKind::Let { name, value, .. } => {
-                self.emitln(&format!("auto {} = {};", name, self.gen_expr(value)));
+            ExprKind::Let { name, ty, value, .. } => {
+                let decl = ty.as_ref().map(|t| self.gen_type(t)).unwrap_or_else(|| "auto".into());
+                self.emitln(&format!("{} {} = {};", decl, Self::safe_ident(name), self.gen_expr(value)));
             }
             ExprKind::If { cond, then_branch, else_branch } => {
                 self.emitln(&format!("if ({}) {{", self.gen_expr(cond)));
@@ -384,6 +547,11 @@ impl CppGenerator {
                     self.emitln("} else {");
                     self.indent += 1; self.emit_block(eb, is_tail); self.indent -= 1;
                 }
+                self.emitln("}");
+            }
+            ExprKind::While { cond, body } => {
+                self.emitln(&format!("while ({}) {{", self.gen_expr(cond)));
+                self.indent += 1; self.emit_block(body, false); self.indent -= 1;
                 self.emitln("}");
             }
             ExprKind::Binary { op, left, right } => {
@@ -407,10 +575,6 @@ impl CppGenerator {
         if self.dispatch.contains_key(&name) {
             return format!("_d_{}({})", name, args.join(", "));
         }
-        // Single-impl trait methods → fat pointer vtable call
-        if args.len() == 1 && self.trait_methods.contains(&name) {
-            return format!("{}.{}()", args[0], name);
-        }
         format!("{}({})", mapped, args.join(", "))
     }
 
@@ -418,24 +582,125 @@ impl CppGenerator {
         match &expr.kind {
             ExprKind::IntLiteral(n) => n.to_string(),
             ExprKind::FloatLiteral(n) => format!("{}", n),
-            ExprKind::StringLiteral(s) => format!("\"{}\"", s),
+            ExprKind::StringLiteral(s) => format!("std::string(\"{}\")", Self::escape_cpp_string(s)),
             ExprKind::BoolLiteral(b) => if *b { "true".into() } else { "false".into() },
-            ExprKind::Ident(name) => name.clone(),
-            ExprKind::Field { object, field } => format!("{}.{}", self.gen_expr(object), field),
-            ExprKind::DotAccess { object, field } => format!("{}.{}", self.gen_expr(object), field),
+            ExprKind::Ident(name) => Self::safe_ident(name),
+            ExprKind::Field { object, field } => format!("{}.{}", self.gen_expr(object), Self::safe_ident(field)),
+            ExprKind::DotAccess { object, field } => format!("{}.{}", self.gen_expr(object), Self::safe_ident(field)),
             ExprKind::Binary { op, left, right } =>
                 format!("({} {} {})", self.gen_expr(left), op.cpp_op(), self.gen_expr(right)),
             ExprKind::Call { func, args } => {
-                let a: Vec<String> = args.iter().map(|a| self.gen_expr(a)).collect();
+                let ordered = self.order_call_args(func, args);
+                let a: Vec<String> = ordered.iter().map(|a| self.gen_expr(a)).collect();
                 self.call_name(func, &a)
             }
+            ExprKind::NamedArg { value, .. } => self.gen_expr(value),
+            ExprKind::Assign { target, value } => format!("{} = {}", self.gen_expr(target), self.gen_expr(value)),
+            ExprKind::CppBlock(src) => src.trim().to_string(),
             ExprKind::StructLit { path, fields } => {
                 let tn = path.join("::");
                 let vals: Vec<String> = fields.iter().map(|(_, v)| self.gen_expr(v)).collect();
                 format!("{} {{ {} }}", tn, vals.join(", "))
             }
+            ExprKind::GcNew { ty, fields } => {
+                let vals: Vec<String> = fields.iter().map(|(_, v)| self.gen_expr(v)).collect();
+                format!("nova::gc_alloc<{}>({})", self.gen_type(ty), vals.join(", "))
+            }
+            ExprKind::EnumCtor { path, case, arg } => {
+                let a = arg.as_ref().map(|e| self.gen_expr(e)).unwrap_or_default();
+                match self.enum_cases.get(case) {
+                    // Generic enums go through deduction helpers: payload cases
+                    // deduce from the argument, payload-less cases produce a tag
+                    // that converts to whatever instantiation the context needs.
+                    Some((ename, _, has_payload, true)) => {
+                        if *has_payload { format!("{}__{}({})", ename, case, a) }
+                        else { format!("{}__{}_t{{}}", ename, case) }
+                    }
+                    Some((ename, _, _, false)) => format!("{}::{}({})", ename, Self::safe_ident(case), a),
+                    None => format!("{}::{}({})", path.join("::"), Self::safe_ident(case), a),
+                }
+            }
+            ExprKind::Match { expr: subject, arms } => self.gen_match(subject, arms),
             _ => format!("/* {:?} */", expr.kind),
         }
+    }
+
+    /// Match compiles to an immediately-invoked lambda so it stays an expression.
+    fn gen_match(&self, subject: &Expr, arms: &[MatchArm]) -> String {
+        let mut s = String::from("([&]() {\n");
+        s.push_str(&format!("    auto&& _m = {};\n", self.gen_expr(subject)));
+        for arm in arms {
+            let body = self.gen_expr(&arm.body);
+            let guard = arm.guard.as_ref().map(|g| self.gen_expr(g));
+            match &arm.pattern.kind {
+                PatternKind::EnumCtor { case, inner, .. } => {
+                    if let Some((_, tag, has_payload, _)) = self.enum_cases.get(case) {
+                        s.push_str(&format!("    if (_m._tag == {}) {{\n", tag));
+                        if *has_payload {
+                            if let Some(p) = inner {
+                                if let PatternKind::Variable { name, .. } = &p.kind {
+                                    s.push_str(&format!("      auto {} = _m._{};\n", Self::safe_ident(name), case));
+                                }
+                            }
+                        }
+                        match &guard {
+                            Some(g) => s.push_str(&format!("      if ({}) return {};\n    }}\n", g, body)),
+                            None => s.push_str(&format!("      return {};\n    }}\n", body)),
+                        }
+                    } else {
+                        s.push_str(&format!("    /* unknown enum case: {} */\n", case));
+                    }
+                }
+                PatternKind::Literal(lit) => {
+                    let l = match lit {
+                        LiteralPat::Int(n) => n.to_string(),
+                        LiteralPat::Float(f) => f.to_string(),
+                        LiteralPat::String(v) => format!("std::string(\"{}\")", Self::escape_cpp_string(v)),
+                        LiteralPat::Char(c) => format!("'{}'", c),
+                        LiteralPat::Bool(b) => b.to_string(),
+                        LiteralPat::Nil => "nullptr".into(),
+                    };
+                    match &guard {
+                        Some(g) => s.push_str(&format!("    if (_m == {} && ({})) return {};\n", l, g, body)),
+                        None => s.push_str(&format!("    if (_m == {}) return {};\n", l, body)),
+                    }
+                }
+                PatternKind::Variable { name, .. } => {
+                    s.push_str(&format!("    {{ auto {} = _m;\n", Self::safe_ident(name)));
+                    match &guard {
+                        Some(g) => s.push_str(&format!("      if ({}) return {};\n    }}\n", g, body)),
+                        None => s.push_str(&format!("      return {};\n    }}\n", body)),
+                    }
+                }
+                PatternKind::Wildcard => {
+                    match &guard {
+                        Some(g) => s.push_str(&format!("    if ({}) return {};\n", g, body)),
+                        None => s.push_str(&format!("    return {};\n", body)),
+                    }
+                }
+                other => s.push_str(&format!("    /* unsupported pattern: {:?} */\n", other)),
+            }
+        }
+        s.push_str("    std::abort();\n  }())");
+        s
+    }
+
+    /// Resolve ~name: value arguments into declaration order using the target's
+    /// signature; positional calls pass through untouched.
+    fn order_call_args<'a>(&self, func: &Expr, args: &'a [Expr]) -> Vec<&'a Expr> {
+        let has_named = args.iter().any(|a| matches!(a.kind, ExprKind::NamedArg { .. }));
+        if has_named {
+            if let ExprKind::Ident(name) = &func.kind {
+                if let Some(overloads) = self.fn_sigs.get(name) {
+                    for ov in overloads {
+                        if let Some(slots) = crate::typeck::assign_arg_slots(&ov.params, args) {
+                            return slots.into_iter().map(|ai| &args[ai]).collect();
+                        }
+                    }
+                }
+            }
+        }
+        args.iter().collect()
     }
 
     fn gen_type(&self, ty: &Type) -> String {
@@ -444,6 +709,7 @@ impl CppGenerator {
                 if s.args.is_empty() { self.map_primitive(&s.name).to_string() }
                 else { format!("{}<{}>", s.name, s.args.iter().map(|a| self.gen_type(a)).collect::<Vec<_>>().join(", ")) }
             }).collect::<Vec<_>>().join("::"),
+            Type::GcRef(inner) => format!("nova::gc_ptr<{}>", self.gen_type(inner)),
             Type::Unit => "void".to_string(),
             _ => "auto".to_string(),
         }
@@ -454,7 +720,40 @@ impl CppGenerator {
     }
 
     fn map_runtime(&self, name: &str) -> String {
-        match name { "print" => "nova_print".into(), "print_int" => "nova_print_int".into(), _ => name.to_string() }
+        match name {
+            "print" => "nova_print".into(),
+            "println" => "nova_println".into(),
+            "print_int" => "nova_print_int".into(),
+            _ => Self::safe_ident(name),
+        }
+    }
+
+    /// Nova identifiers that collide with C++ keywords get a trailing underscore.
+    fn safe_ident(name: &str) -> String {
+        const CPP_KEYWORDS: &[&str] = &[
+            "default", "new", "delete", "class", "template", "typename", "this",
+            "operator", "private", "public", "protected", "namespace", "union",
+            "virtual", "friend", "inline", "mutable", "typedef", "using", "volatile",
+            "extern", "register", "signed", "unsigned", "short", "long", "int",
+            "float", "double", "char", "bool", "void", "auto", "const", "static",
+            "switch", "do", "goto", "try", "catch", "throw", "sizeof", "export",
+        ];
+        if CPP_KEYWORDS.contains(&name) { format!("{}_", name) } else { name.to_string() }
+    }
+
+    fn escape_cpp_string(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                _ => out.push(c),
+            }
+        }
+        out
     }
 
     fn trait_name(&self, ty: &Type) -> Option<String> {
@@ -497,7 +796,7 @@ impl CppGenerator {
                 let mut j = 0;
                 for (i, pos) in info.positions.iter().enumerate() {
                     if pos.is_some() {
-                        if Self::last_name(&ov.params[i]) == Some(combo[j].as_str()) {
+                        if Self::last_name(&ov.params[i].ty) == Some(combo[j].as_str()) {
                             cargs.push(format!("*({}*)a{}._ptr", combo[j], i));
                         } else {
                             cargs.push(format!("a{}", i));
@@ -508,7 +807,7 @@ impl CppGenerator {
                     }
                 }
                 self.emitln(&format!("  _t_{}[{}ULL] = []({}) -> {} {{ return {}({}); }};",
-                    name, key, pdecls.join(", "), ret, name, cargs.join(", ")));
+                    name, key, pdecls.join(", "), ret, Self::safe_ident(&name), cargs.join(", ")));
             }
             self.emitln(&format!("}} }} _reg_{};", name));
 
@@ -520,7 +819,7 @@ impl CppGenerator {
             self.emitln(&format!("  auto it = _t_{0}.find(k);", name));
             self.emitln(&format!("  if (it != _t_{0}.end()) {{ _c_{0} = {{k, it->second}}; return it->second({1}); }}", name, anames.join(", ")));
             if info.has_generic_fallback {
-                self.emitln(&format!("  return {}({});", name, anames.join(", ")));
+                self.emitln(&format!("  return {}({});", Self::safe_ident(&name), anames.join(", ")));
             } else {
                 self.emitln(&format!("  std::cerr << \"nova: no matching method for '{}'\" << std::endl; std::abort();", name));
             }
