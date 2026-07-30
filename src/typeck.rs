@@ -353,6 +353,44 @@ impl TypeChecker {
         self.check_expr(expr, &HashMap::new(), res)
     }
 
+    /// Best-effort inference of the type of variable `name` as visible at byte
+    /// `offset` inside function `f`. Used by the LSP for dot-completion.
+    pub fn infer_var_type_at(&self, f: &Function, name: &str, offset: usize) -> Option<Type> {
+        let mut env: HashMap<String, Type> = HashMap::new();
+        for p in &f.params { env.insert(p.name.clone(), p.ty.clone()); }
+        self.collect_bindings_before(&f.body, offset, &mut env);
+        env.get(name).cloned()
+    }
+
+    /// Record let-binding types for statements before `offset`, descending only
+    /// into nested blocks that contain it (matching lexical scoping).
+    fn collect_bindings_before(&self, block: &Block, offset: usize, env: &mut HashMap<String, Type>) {
+        let mut res = ResolutionMap::new();
+        for stmt in &block.stmts {
+            if stmt.span.start >= offset { break; }
+            match &stmt.kind {
+                ExprKind::Let { name, ty, value, .. } => {
+                    let vt = ty.clone().or_else(|| self.check_expr(value, env, &mut res).ok());
+                    if let Some(vt) = vt { env.insert(name.clone(), vt); }
+                }
+                ExprKind::Block(b) => self.descend_if_contains(b, offset, env),
+                ExprKind::If { then_branch, else_branch, .. } => {
+                    self.descend_if_contains(then_branch, offset, env);
+                    if let Some(eb) = else_branch { self.descend_if_contains(eb, offset, env); }
+                }
+                ExprKind::While { body, .. } => self.descend_if_contains(body, offset, env),
+                ExprKind::For { body, .. } => self.descend_if_contains(body, offset, env),
+                _ => {}
+            }
+        }
+    }
+
+    fn descend_if_contains(&self, block: &Block, offset: usize, env: &mut HashMap<String, Type>) {
+        if block.span.start < offset && offset <= block.span.end {
+            self.collect_bindings_before(block, offset, env);
+        }
+    }
+
     fn match_score(&self, sig: &FunctionType, params: Option<&Vec<Param>>, args: &[Expr], arg_types: &[Type]) -> Option<i32> {
         if sig.params.is_empty() { return Some(0); } // variadic builtins
         if sig.params.len() != arg_types.len() { return None; }

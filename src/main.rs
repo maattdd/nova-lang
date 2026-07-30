@@ -9,11 +9,11 @@ mod codegen;
 mod import_macro;
 mod interpreter;
 mod resolve;
+mod lsp;
 pub mod traits;
 
 use crate::error::CompileError;
-use crate::ast::Item;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::fs;
 
@@ -22,9 +22,12 @@ use std::fs;
 #[command(name = "nova")]
 #[command(about = "Nova language compiler", version = "0.1.0")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Input .nv source file
     #[arg(value_name = "FILE")]
-    input: PathBuf,
+    input: Option<PathBuf>,
 
     /// Output C++ file (default: stdout if -o not specified)
     #[arg(short = 'o', long = "output")]
@@ -47,21 +50,40 @@ struct Cli {
     lib_paths: Vec<PathBuf>,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Start the LSP server for IDE integration
+    Lsp,
+}
+
 fn main() {
     let cli = Cli::parse();
-    let file_path = cli.input.display().to_string();
 
-    if let Err(e) = run(&cli) {
-        // Read source for error display
-        let source = fs::read_to_string(&cli.input).unwrap_or_default();
-        eprintln!("{}", e.display_with_source(&source, &file_path));
-        std::process::exit(1);
+    match cli.command {
+        Some(Command::Lsp) => {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            rt.block_on(lsp::run());
+        }
+        None => {
+            let input = cli.input.clone().unwrap_or_else(|| {
+                eprintln!("Error: no input file specified and no subcommand given.");
+                eprintln!("Use `nova lsp` to start the LSP server, or `nova <file>` to compile.");
+                std::process::exit(1);
+            });
+            let file_path = input.display().to_string();
+
+            if let Err(e) = run(&cli, &input) {
+                let source = fs::read_to_string(&input).unwrap_or_default();
+                eprintln!("{}", e.display_with_source(&source, &file_path));
+                std::process::exit(1);
+            }
+        }
     }
 }
 
-fn run(cli: &Cli) -> Result<(), CompileError> {
-    let source = fs::read_to_string(&cli.input)?;
-    let module_name = cli.input
+fn run(cli: &Cli, input: &PathBuf) -> Result<(), CompileError> {
+    let source = fs::read_to_string(input)?;
+    let module_name = input
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("main")
@@ -69,7 +91,7 @@ fn run(cli: &Cli) -> Result<(), CompileError> {
 
     // Setup search paths for @import
     let mut search_paths = cli.lib_paths.clone();
-    if let Some(parent) = cli.input.parent() {
+    if let Some(parent) = input.parent() {
         search_paths.push(parent.to_path_buf());
     }
     search_paths.push(PathBuf::from("."));

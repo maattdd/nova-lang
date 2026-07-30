@@ -8,3 +8,8 @@ description = "Nova language compiler — a modern systems language with Julia-l
 clap = { version = "4", features = ["derive"] }
 thiserror = "1"
 ariadne = "0.4"
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "io-std", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "5"
