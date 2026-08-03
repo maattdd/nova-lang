@@ -13,7 +13,6 @@ mod lsp;
 pub mod traits;
 
 use crate::error::CompileError;
-use crate::ast::Item;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::Command;
@@ -78,24 +77,44 @@ enum Commands {
         #[arg(long = "keep-temp")]
         keep_temp: bool,
     },
+    /// Interpret a .nv file directly without compiling to C++
+    Interpret {
+        /// Input .nv source file
+        #[arg(value_name = "FILE")]
+        input: PathBuf,
+
+        /// Additional search paths for modules (can be specified multiple times)
+        #[arg(short = 'L', long = "lib-path")]
+        lib_paths: Vec<PathBuf>,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    if let Some(Commands::Run { input, standalone, lib_paths, cxx, keep_temp }) = &cli.command {
-        if let Err(e) = run_nova(input, *standalone, lib_paths, &cxx, *keep_temp) {
-            let source = fs::read_to_string(input).unwrap_or_default();
-            eprintln!("{}", e.display_with_source(&source, &input.display().to_string()));
-            std::process::exit(1);
+    match &cli.command {
+        Some(Commands::Run { input, standalone, lib_paths, cxx, keep_temp }) => {
+            if let Err(e) = run_nova(input, *standalone, lib_paths, &cxx, *keep_temp) {
+                let source = fs::read_to_string(input).unwrap_or_default();
+                eprintln!("{}", e.display_with_source(&source, &input.display().to_string()));
+                std::process::exit(1);
+            }
+            return;
         }
-        return;
-    }
-
-    if let Some(Commands::Lsp) = &cli.command {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-        rt.block_on(lsp::run());
-        return;
+        Some(Commands::Interpret { input, lib_paths }) => {
+            if let Err(e) = interpret(input, lib_paths) {
+                let source = fs::read_to_string(input).unwrap_or_default();
+                eprintln!("{}", e.display_with_source(&source, &input.display().to_string()));
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some(Commands::Lsp) => {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            rt.block_on(lsp::run());
+            return;
+        }
+        None => {}
     }
 
     let Some(input) = cli.input.as_ref() else {
@@ -286,6 +305,58 @@ fn run(cli: &Cli) -> Result<(), CompileError> {
         } else {
             println!("{}", output);
         }
+    }
+
+    Ok(())
+}
+
+fn interpret(input: &PathBuf, lib_paths: &[PathBuf]) -> Result<(), CompileError> {
+    let source = fs::read_to_string(input)?;
+    let module_name = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("main")
+        .to_string();
+
+    // Setup search paths
+    let mut search_paths = lib_paths.to_vec();
+    if let Some(parent) = input.parent() {
+        search_paths.push(parent.to_path_buf());
+    }
+    search_paths.push(PathBuf::from("."));
+
+    // Init import macro and interpreter (for macro expansion)
+    let import_macro = import_macro::ImportMacro::new(search_paths.clone());
+    let macro_interp = interpreter::Interpreter::new(search_paths.clone());
+
+    // Lex
+    let mut lex = lexer::Lexer::new(&source);
+    let tokens = lex.tokenize()?;
+
+    // Parse
+    let mut p = parser::Parser::new(tokens, &source);
+    let mut module = p.parse_module(module_name.clone())?;
+
+    // Expand macros (including @import)
+    let mut expander = macro_expand::MacroExpander::new(import_macro, macro_interp);
+    expander.register_structs(&module);
+    expander.expand_module(&mut module)?;
+
+    // Type check (resolves DotAccess → field/UFCS, etc.)
+    let mut checker = typeck::TypeChecker::new();
+    checker.register_types(&module);
+    let resolutions = checker.check_module(&module)?;
+    resolve::apply_resolutions(&mut module, &resolutions);
+
+    // Create a fresh interpreter for runtime evaluation
+    let mut rt = interpreter::Interpreter::new(search_paths);
+    rt.enable_runtime_mode();
+    rt.register_module(&module);
+
+    // Call main()
+    let main_args: Vec<interpreter::Value> = vec![];
+    if let Err(e) = rt.call_function("main", &main_args, crate::token::Span::zero()) {
+        return Err(e);
     }
 
     Ok(())

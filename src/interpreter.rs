@@ -16,17 +16,82 @@ pub enum Value {
     Item(Item),
     List(Vec<Value>),
     Module(Module),
+    /// Runtime struct instance: type name, field_name → value.
+    /// The type name is what runtime overload dispatch keys on.
+    Struct(String, HashMap<String, Value>),
+    /// Enum variant: case name, optional payload
+    Enum(String, Option<Box<Value>>),
     Nil,
 }
 
 pub struct Interpreter {
     search_paths: Vec<PathBuf>,
     known_structs: HashMap<String, Struct>,
+    /// User-defined functions available at runtime; a name maps to its
+    /// overload set (Nova allows overloading by parameter type, like the C++
+    /// output does)
+    functions: HashMap<String, Vec<Function>>,
+    /// type name → traits it implements, from `impl Trait for Type` blocks
+    impls: HashMap<String, Vec<String>>,
+    /// Runtime mode: enables print/println/exit builtins
+    runtime_mode: bool,
 }
 
 impl Interpreter {
     pub fn new(search_paths: Vec<PathBuf>) -> Self {
-        Self { search_paths, known_structs: HashMap::new() }
+        Self { search_paths, known_structs: HashMap::new(), functions: HashMap::new(), impls: HashMap::new(), runtime_mode: false }
+    }
+
+    /// Enable runtime mode (print, println, etc.)
+    pub fn enable_runtime_mode(&mut self) {
+        self.runtime_mode = true;
+    }
+
+    /// Register structs AND functions from a module for runtime evaluation
+    pub fn register_module(&mut self, module: &Module) {
+        self.register_structs(module);
+        for item in &module.items {
+            match item {
+                Item::Function(f) => {
+                    if !f.body.stmts.is_empty() {
+                        self.functions.entry(f.name.clone()).or_default().push(f.clone());
+                    }
+                }
+                Item::Impl(impl_block) => {
+                    if let Some(target) = Self::type_name(&impl_block.target_type) {
+                        self.impls.entry(target.to_string()).or_default().push(impl_block.trait_name.clone());
+                    }
+                    for method in &impl_block.methods {
+                        if !method.body.stmts.is_empty() {
+                            self.functions.entry(method.name.clone()).or_default().push(method.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The bare name of a type, seen through @T references (e.g. `@Point` → "Point")
+    fn type_name(ty: &Type) -> Option<&str> {
+        match ty {
+            Type::Path(p) => p.segments.last().map(|s| s.name.as_str()),
+            Type::GcRef(inner) => Self::type_name(inner),
+            _ => None,
+        }
+    }
+
+    /// The runtime type of a value, where it has a nameable one. Macro-time
+    /// values (Expr, Item, List, …) return None and stay neutral in dispatch.
+    fn value_type_name(value: &Value) -> Option<&str> {
+        match value {
+            Value::Int(_) => Some("Int"),
+            Value::Float(_) => Some("Float"),
+            Value::String(_) => Some("String"),
+            Value::Bool(_) => Some("Bool"),
+            Value::Struct(name, _) => Some(name),
+            _ => None,
+        }
     }
 
     pub fn register_structs(&mut self, module: &Module) {
@@ -50,6 +115,21 @@ impl Interpreter {
             ExprKind::StringLiteral(s) => Ok(Value::String(s.clone())),
             ExprKind::BoolLiteral(b) => Ok(Value::Bool(*b)),
             ExprKind::NilLiteral => Ok(Value::Nil),
+
+            ExprKind::Unary { op, expr: inner } => {
+                let val = self.eval(inner, env)?;
+                match op {
+                    UnaryOp::Neg => match val {
+                        Value::Int(n) => Ok(Value::Int(-n)),
+                        Value::Float(n) => Ok(Value::Float(-n)),
+                        _ => Err(CompileError::macro_err("Cannot negate this type", expr.span)),
+                    },
+                    UnaryOp::Not => match val {
+                        Value::Bool(b) => Ok(Value::Bool(!b)),
+                        _ => Err(CompileError::macro_err("Cannot ! this type", expr.span)),
+                    },
+                }
+            }
 
             ExprKind::Ident(name) => env.get(name).cloned().ok_or_else(|| {
                 CompileError::macro_err(format!("Undefined: '{}'", name), expr.span)
@@ -75,20 +155,59 @@ impl Interpreter {
                 match op {
                     BinOp::Add => match (&l, &r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
                         (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
                         _ => Err(CompileError::macro_err("Cannot add these types", expr.span)),
                     },
                     BinOp::Sub => match (&l, &r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
                         _ => Err(CompileError::macro_err("Cannot subtract", expr.span)),
                     },
                     BinOp::Mul => match (&l, &r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
                         _ => Err(CompileError::macro_err("Cannot multiply", expr.span)),
+                    },
+                    BinOp::Div => match (&l, &r) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a / b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
+                        _ => Err(CompileError::macro_err("Cannot divide", expr.span)),
+                    },
+                    BinOp::Mod => match (&l, &r) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a % b)),
+                        _ => Err(CompileError::macro_err("Cannot modulo", expr.span)),
                     },
                     BinOp::Eq => Ok(Value::Bool(self.equal(&l, &r))),
                     BinOp::NotEq => Ok(Value::Bool(!self.equal(&l, &r))),
-                    _ => Err(CompileError::macro_err("Unsupported operator", expr.span)),
+                    BinOp::Lt => match (&l, &r) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
+                        _ => Err(CompileError::macro_err("Cannot compare", expr.span)),
+                    },
+                    BinOp::Gt => match (&l, &r) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
+                        _ => Err(CompileError::macro_err("Cannot compare", expr.span)),
+                    },
+                    BinOp::LtEq => match (&l, &r) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a <= b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a <= b)),
+                        _ => Err(CompileError::macro_err("Cannot compare", expr.span)),
+                    },
+                    BinOp::GtEq => match (&l, &r) {
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a >= b)),
+                        _ => Err(CompileError::macro_err("Cannot compare", expr.span)),
+                    },
+                    BinOp::And => match (&l, &r) {
+                        (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
+                        _ => Err(CompileError::macro_err("And requires bool", expr.span)),
+                    },
+                    BinOp::Or => match (&l, &r) {
+                        (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
+                        _ => Err(CompileError::macro_err("Or requires bool", expr.span)),
+                    },
                 }
             }
 
@@ -100,7 +219,7 @@ impl Interpreter {
                 let evaled: Vec<Value> = args.iter()
                     .map(|a| self.eval(a, env))
                     .collect::<Result<_, _>>()?;
-                self.call_builtin(&name, &evaled, expr.span)
+                self.call_function(&name, &evaled, expr.span)
             }
 
             ExprKind::CompileTimeResult(items) => Ok(Value::Items(items.clone())),
@@ -183,6 +302,129 @@ impl Interpreter {
 
             ExprKind::NamedArg { value, .. } => self.eval(value, env),
 
+            // @cpp { ... } — only std::exit is handled in interpreter mode
+            ExprKind::CppBlock(code) => {
+                if self.runtime_mode {
+                    if code.contains("std::exit") {
+                        std::process::exit(1);
+                    }
+                    return Err(CompileError::macro_err(
+                        format!("@cpp blocks are not supported in interpreter mode: {}", code.trim()), expr.span,
+                    ));
+                }
+                Ok(Value::Nil)
+            }
+
+            // While loop
+            ExprKind::While { cond, body } => {
+                let mut last = Value::Nil;
+                loop {
+                    let cond_val = self.eval(cond, env)?;
+                    let keep_going = match cond_val {
+                        Value::Bool(b) => b,
+                        _ => return Err(CompileError::macro_err("While condition must be bool", expr.span)),
+                    };
+                    if !keep_going { break; }
+                    for stmt in &body.stmts {
+                        last = self.eval(stmt, env)?;
+                    }
+                }
+                Ok(last)
+            }
+
+            // Struct literal: TypeName { field: val, ... }
+            ExprKind::StructLit { path, fields } => {
+                let type_name = path.last().cloned().unwrap_or_default();
+                let mut map = HashMap::new();
+                for (name, val_expr) in fields {
+                    let val = self.eval(val_expr, env)?;
+                    map.insert(name.clone(), val);
+                }
+                Ok(Value::Struct(type_name, map))
+            }
+
+            // GC allocation: @Type { fields } — treat like struct in interpreter
+            ExprKind::GcNew { ty, fields } => {
+                let type_name = Self::type_name(ty).unwrap_or_default().to_string();
+                let mut map = HashMap::new();
+                for (name, val_expr) in fields {
+                    let val = self.eval(val_expr, env)?;
+                    map.insert(name.clone(), val);
+                }
+                Ok(Value::Struct(type_name, map))
+            }
+
+            // Enum constructor: .CaseName or .CaseName(arg)
+            ExprKind::EnumCtor { case, arg, .. } => {
+                let payload = match arg {
+                    Some(a) => Some(Box::new(self.eval(a, env)?)),
+                    None => None,
+                };
+                Ok(Value::Enum(case.clone(), payload))
+            }
+
+            // Pattern matching
+            ExprKind::Match { expr: matched, arms } => {
+                let val = self.eval(matched, env)?;
+                for arm in arms {
+                    if let Some(bindings) = self.match_pattern(&val, &arm.pattern)? {
+                        // Check guard if present
+                        if let Some(ref guard) = arm.guard {
+                            let mut guard_env = env.clone();
+                            for (name, v) in &bindings {
+                                guard_env.insert(name.clone(), v.clone());
+                            }
+                            let guard_val = self.eval(guard, &mut guard_env)?;
+                            if let Value::Bool(false) = guard_val {
+                                continue;
+                            }
+                        }
+                        // Pattern matched — evaluate body with bindings
+                        let mut body_env = env.clone();
+                        for (name, v) in &bindings {
+                            body_env.insert(name.clone(), v.clone());
+                        }
+                        return self.eval(&arm.body, &mut body_env);
+                    }
+                }
+                Err(CompileError::macro_err("No matching pattern", expr.span))
+            }
+
+            // Type path used as an expression (e.g. returning a Matrix type)
+            ExprKind::Path(segments) => {
+                // Return the type name as a string for now
+                let name = segments.join("::");
+                Ok(Value::String(name))
+            }
+
+            // Lambda / closure — not supported yet
+            ExprKind::Lambda { .. } => {
+                Err(CompileError::macro_err("Lambdas not supported in interpreter", expr.span))
+            }
+
+            // AssignOp: x += 1
+            ExprKind::AssignOp { target, op, value } => {
+                let target_name = match &target.kind {
+                    ExprKind::Ident(n) => n.clone(),
+                    _ => return Err(CompileError::macro_err("Can only assign to variables", expr.span)),
+                };
+                let current = env.get(&target_name).cloned().unwrap_or(Value::Nil);
+                let rhs = self.eval(value, env)?;
+                let result = match op {
+                    BinOp::Add => match (&current, &rhs) {
+                        (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+                        _ => return Err(CompileError::macro_err("Cannot += these types", expr.span)),
+                    },
+                    BinOp::Sub => match (&current, &rhs) {
+                        (Value::Int(a), Value::Int(b)) => Value::Int(a - b),
+                        _ => return Err(CompileError::macro_err("Cannot -= these types", expr.span)),
+                    },
+                    _ => return Err(CompileError::macro_err("Unsupported assign-op", expr.span)),
+                };
+                env.insert(target_name, result.clone());
+                Ok(result)
+            }
+
             _ => Err(CompileError::macro_err(
                 format!("Unsupported: {:?}", expr.kind), expr.span,
             )),
@@ -192,17 +434,36 @@ impl Interpreter {
     fn equal(&self, a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
+            (Value::Enum(a_case, a_payload), Value::Enum(b_case, b_payload)) => {
+                if a_case != b_case { return false; }
+                match (a_payload, b_payload) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => self.equal(a, b),
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
 
     fn access_field(&self, obj: &Value, field: &str, span: Span) -> Result<Value, CompileError> {
         match (obj, field) {
+            // Struct field access
+            (Value::Struct(type_name, fields), _) => {
+                fields.get(field).cloned().ok_or_else(|| {
+                    CompileError::macro_err(
+                        format!("Struct '{}' has no field '{}'", type_name, field), span,
+                    )
+                })
+            }
+            // Module introspection
             (Value::Module(m), "name") => Ok(Value::String(m.name.clone())),
             (Value::Module(m), "items") => Ok(Value::Items(m.items.clone())),
+            // Item introspection
             (Value::Item(item), "name") => Ok(Value::String(match item {
                 Item::Function(f) => f.name.clone(),
                 Item::Struct(s) => s.name.clone(),
@@ -224,6 +485,141 @@ impl Interpreter {
             }.into())),
             _ => Err(CompileError::macro_err(format!("Unknown field '{}'", field), span)),
         }
+    }
+
+    /// Try to match a pattern against a value. Returns Some(bindings) on success, None on failure.
+    fn match_pattern(
+        &self,
+        value: &Value,
+        pattern: &Pattern,
+    ) -> Result<Option<HashMap<String, Value>>, CompileError> {
+        match &pattern.kind {
+            PatternKind::Wildcard => Ok(Some(HashMap::new())),
+            PatternKind::Variable { name, .. } => {
+                let mut bindings = HashMap::new();
+                bindings.insert(name.clone(), value.clone());
+                Ok(Some(bindings))
+            }
+            PatternKind::EnumCtor { case, inner, .. } => {
+                match value {
+                    Value::Enum(val_case, val_payload) if val_case == case => {
+                        match (inner, val_payload) {
+                            (None, None) => Ok(Some(HashMap::new())),
+                            (Some(inner_pat), Some(payload)) => {
+                                self.match_pattern(payload, inner_pat)
+                            }
+                            (None, Some(_)) => Ok(None), // pattern expects no payload but value has one
+                            (Some(_), None) => Ok(None), // pattern expects payload but value has none
+                        }
+                    }
+                    _ => Ok(None),
+                }
+            }
+            PatternKind::Literal(lit) => match (lit, value) {
+                (LiteralPat::Int(a), Value::Int(b)) => Ok(if a == b { Some(HashMap::new()) } else { None }),
+                (LiteralPat::Bool(a), Value::Bool(b)) => Ok(if a == b { Some(HashMap::new()) } else { None }),
+                (LiteralPat::String(a), Value::String(b)) => Ok(if a == b { Some(HashMap::new()) } else { None }),
+                (LiteralPat::Nil, Value::Nil) => Ok(Some(HashMap::new())),
+                _ => Ok(None),
+            },
+            _ => Err(CompileError::macro_err(
+                format!("Unsupported pattern: {:?}", pattern.kind), pattern.span,
+            )),
+        }
+    }
+
+    /// Call a function by name (user-defined or builtin)
+    pub fn call_function(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, CompileError> {
+        // Check for user-defined function first
+        if let Some(overloads) = self.functions.get(name) {
+            let mut candidates: Vec<Function> =
+                overloads.iter().filter(|f| f.params.len() == args.len()).cloned().collect();
+            if candidates.is_empty() {
+                // No overload with this arity — report against the first one
+                let func = overloads[0].clone();
+                return self.call_user_function(&func, args, span);
+            }
+            if candidates.len() == 1 {
+                let func = candidates.remove(0);
+                return self.call_user_function(&func, args, span);
+            }
+            // Several overloads: dispatch on the runtime types of the arguments.
+            // An exact type match outranks a trait match, so e.g.
+            // inner(Matrix, HotVector) beats inner(Matrix, Matrix) for a HotVector.
+            let mut best: Option<(u32, Function)> = None;
+            for func in candidates {
+                if let Some(score) = self.overload_score(&func, args) {
+                    let beaten = best.as_ref().is_some_and(|(b, _)| *b >= score);
+                    if !beaten {
+                        best = Some((score, func));
+                    }
+                }
+            }
+            return match best {
+                Some((_, func)) => self.call_user_function(&func, args, span),
+                None => Err(CompileError::macro_err(
+                    format!("No overload of '{}' matches the argument types", name), span,
+                )),
+            };
+        }
+        // Fall back to builtins
+        self.call_builtin(name, args, span)
+    }
+
+    /// Rank an overload against runtime argument types: 2 per exact type
+    /// match, 1 per trait match, 0 where either side has no nameable type.
+    /// None means a definite mismatch — the overload is not viable.
+    fn overload_score(&self, func: &Function, args: &[Value]) -> Option<u32> {
+        let mut total = 0;
+        for (param, arg) in func.params.iter().zip(args) {
+            total += match (Self::type_name(&param.ty), Self::value_type_name(arg)) {
+                (Some(p), Some(a)) if p == a => 2,
+                (Some(p), Some(a))
+                    if self.impls.get(a).is_some_and(|traits| traits.iter().any(|t| t == p)) => 1,
+                (Some(_), Some(_)) => return None,
+                _ => 0,
+            };
+        }
+        Some(total)
+    }
+
+    /// Evaluate a user-defined function body with bound arguments
+    fn call_user_function(
+        &mut self,
+        func: &Function,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, CompileError> {
+        if func.params.len() != args.len() {
+            return Err(CompileError::macro_err(
+                format!("Function '{}' expects {} arguments, got {}", func.name, func.params.len(), args.len()),
+                span,
+            ));
+        }
+        let mut local_env: HashMap<String, Value> = HashMap::new();
+        for (param, arg) in func.params.iter().zip(args.iter()) {
+            local_env.insert(param.name.clone(), arg.clone());
+        }
+        let mut last = Value::Nil;
+        for stmt in &func.body.stmts {
+            match &stmt.kind {
+                ExprKind::Return(Some(inner)) => {
+                    return self.eval(inner, &mut local_env);
+                }
+                ExprKind::Return(None) => {
+                    return Ok(Value::Nil);
+                }
+                _ => {
+                    last = self.eval(stmt, &mut local_env)?;
+                }
+            }
+        }
+        Ok(last)
     }
 
     fn call_builtin(&mut self, name: &str, args: &[Value], span: Span) -> Result<Value, CompileError> {
@@ -485,6 +881,47 @@ impl Interpreter {
                     span
                 )))
             },
+
+            // ─── Runtime builtins (available in interpreter mode) ───
+            "print" if self.runtime_mode => {
+                match args.first() {
+                    Some(Value::String(s)) => print!("{}", s),
+                    Some(Value::Int(n)) => print!("{}", n),
+                    Some(Value::Float(n)) => print!("{}", n),
+                    Some(Value::Bool(b)) => print!("{}", b),
+                    Some(v) => print!("{:?}", v),
+                    None => {}
+                }
+                Ok(Value::Nil)
+            }
+            "println" if self.runtime_mode => {
+                match args.first() {
+                    Some(Value::String(s)) => println!("{}", s),
+                    Some(Value::Int(n)) => println!("{}", n),
+                    Some(Value::Float(n)) => println!("{}", n),
+                    Some(Value::Bool(b)) => println!("{}", b),
+                    Some(v) => println!("{:?}", v),
+                    None => println!(),
+                }
+                Ok(Value::Nil)
+            }
+            "print_int" if self.runtime_mode => {
+                match args.first() {
+                    Some(Value::Int(n)) => { print!("{}", n); Ok(Value::Nil) }
+                    _ => Err(CompileError::macro_err("print_int expects an integer", span)),
+                }
+            }
+            "std::to_string" if self.runtime_mode => {
+                // Used by compile-time macros for codegen; in interpreter just render the value
+                match args.first() {
+                    Some(Value::Int(n)) => Ok(Value::String(n.to_string())),
+                    // Match C++ std::to_string(double): fixed six decimal places
+                    Some(Value::Float(n)) => Ok(Value::String(format!("{:.6}", n))),
+                    Some(Value::String(s)) => Ok(Value::String(s.clone())),
+                    Some(Value::Bool(b)) => Ok(Value::String(b.to_string())),
+                    _ => Ok(Value::String("<unknown>".into())),
+                }
+            }
 
             _ => Err(CompileError::macro_err(format!("Unknown: '{}'", name), span)),
         }
