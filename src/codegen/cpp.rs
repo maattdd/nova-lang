@@ -1,4 +1,5 @@
 use crate::ast::*;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// One overload of a function (free function or impl method).
@@ -33,6 +34,8 @@ pub struct CppGenerator {
     trait_names: HashSet<String>,
     // trait name → concrete impl targets, in declaration order
     trait_impls: BTreeMap<String, Vec<String>>,
+    // concrete type → traits it implements
+    impl_traits: HashMap<String, Vec<String>>,
     type_ids: HashMap<String, u32>,
     // every overload set, for named-argument reordering
     fn_sigs: HashMap<String, Vec<Overload>>,
@@ -40,6 +43,8 @@ pub struct CppGenerator {
     enum_cases: HashMap<String, (String, usize, bool, bool)>,
     // structs allocated via @T — they get a nova::GCObject base
     gc_structs: HashSet<String>,
+    // local variable name → declared type (for coercion of variable references)
+    local_types: RefCell<HashMap<String, Type>>,
 }
 
 impl CppGenerator {
@@ -47,8 +52,10 @@ impl CppGenerator {
         Self {
             output: String::new(), indent: 0, dispatch: BTreeMap::new(),
             return_trait: None, trait_names: HashSet::new(),
-            trait_impls: BTreeMap::new(), type_ids: HashMap::new(),
-            fn_sigs: HashMap::new(), enum_cases: HashMap::new(), gc_structs: HashSet::new(),
+            trait_impls: BTreeMap::new(), impl_traits: HashMap::new(),
+            type_ids: HashMap::new(),
+            fn_sigs: HashMap::new(), enum_cases: HashMap::new(),
+            gc_structs: HashSet::new(), local_types: RefCell::new(HashMap::new()),
         }
     }
 
@@ -98,6 +105,7 @@ impl CppGenerator {
                         self.type_ids.insert(target.to_string(), Self::type_id_of(target));
                         let v = self.trait_impls.entry(imp.trait_name.clone()).or_default();
                         if !v.iter().any(|t| t == target) { v.push(target.to_string()); }
+                        self.impl_traits.entry(target.to_string()).or_default().push(imp.trait_name.clone());
                     }
                     for m in &imp.methods {
                         add(m, &mut names, &mut sets);
@@ -512,6 +520,13 @@ impl CppGenerator {
     fn emit_function(&mut self, func: &Function) {
         self.return_trait = self.trait_name(&func.return_type)
             .filter(|n| self.trait_names.contains(n));
+        // Record parameter types for coercion of variable references
+        {
+            let mut locals = self.local_types.borrow_mut();
+            for p in &func.params {
+                locals.insert(p.name.clone(), p.ty.clone());
+            }
+        }
         let ret = self.gen_type(&func.return_type);
         let params: Vec<String> = func.params.iter().map(|p| format!("{} {}", self.gen_type(&p.ty), Self::safe_ident(&p.name))).collect();
         self.emitln(&format!("{} {}({}) {{", ret, Self::safe_ident(&func.name), params.join(", ")));
@@ -521,6 +536,8 @@ impl CppGenerator {
         self.emitln("}");
         self.emitln("");
         self.return_trait = None;
+        // Clean up local types for this function
+        self.local_types.borrow_mut().clear();
     }
 
     fn emit_block(&mut self, block: &Block, in_expr_pos: bool) {
@@ -538,7 +555,21 @@ impl CppGenerator {
             ExprKind::Return(None) => self.emitln("return;"),
             ExprKind::Let { name, ty, value, .. } => {
                 let decl = ty.as_ref().map(|t| self.gen_type(t)).unwrap_or_else(|| "auto".into());
-                self.emitln(&format!("{} {} = {};", decl, Self::safe_ident(name), self.gen_expr(value)));
+                let val_str = self.gen_expr(value);
+                // Coerce value to declared type if value is a concrete type implementing a trait
+                let init = if let (Some(decl_ty), Some(from_ty)) = (ty.as_ref(), self.infer_expr_type(value)) {
+                    let (coerced, _) = self.coerce_to(&val_str, &from_ty, decl_ty);
+                    coerced
+                } else {
+                    val_str
+                };
+                // Track the local's type for later coercion of variable references
+                if let Some(decl_ty) = ty {
+                    self.local_types.borrow_mut().insert(name.clone(), decl_ty.clone());
+                } else if let Some(inferred) = self.infer_expr_type(value) {
+                    self.local_types.borrow_mut().insert(name.clone(), inferred);
+                }
+                self.emitln(&format!("{} {} = {};", decl, Self::safe_ident(name), init));
             }
             ExprKind::If { cond, then_branch, else_branch } => {
                 self.emitln(&format!("if ({}) {{", self.gen_expr(cond)));
@@ -591,7 +622,27 @@ impl CppGenerator {
                 format!("({} {} {})", self.gen_expr(left), op.cpp_op(), self.gen_expr(right)),
             ExprKind::Call { func, args } => {
                 let ordered = self.order_call_args(func, args);
-                let a: Vec<String> = ordered.iter().map(|a| self.gen_expr(a)).collect();
+                let fn_name = match &func.kind {
+                    ExprKind::Ident(n) => Some(n.as_str()),
+                    ExprKind::DotAccess { field, .. } => Some(field.as_str()),
+                    _ => None,
+                };
+                let params: Option<Vec<&Type>> = fn_name
+                    .and_then(|n| self.fn_sigs.get(n))
+                    .and_then(|ovs| ovs.first())
+                    .map(|o| o.params.iter().map(|p| &p.ty).collect());
+                let a: Vec<String> = ordered.iter().enumerate().map(|(i, arg)| {
+                    let gen = self.gen_expr(arg);
+                    if let Some(ref params) = params {
+                        if let Some(param_ty) = params.get(i) {
+                            if let Some(from_ty) = self.infer_expr_type(arg) {
+                                let (coerced, _) = self.coerce_to(&gen, &from_ty, param_ty);
+                                return coerced;
+                            }
+                        }
+                    }
+                    gen
+                }).collect();
                 self.call_name(func, &a)
             }
             ExprKind::NamedArg { value, .. } => self.gen_expr(value),
@@ -760,8 +811,63 @@ impl CppGenerator {
         match ty { Type::Path(p) if !Self::is_primitive(p) => Some(p.segments.last().unwrap().name.clone()), _ => None }
     }
 
+    /// Best-effort inference of the Nova type of an expression from its AST shape.
+    /// For constructors uses AST shape; for Idents looks up recorded local types.
+    /// Returns None for calls, binary ops, etc.
+    fn infer_expr_type(&self, expr: &Expr) -> Option<Type> {
+        match &expr.kind {
+            ExprKind::StructLit { path, .. } => {
+                Some(Type::Path(Path {
+                    segments: path.iter().map(|n| PathSegment { name: n.clone(), args: vec![] }).collect()
+                }))
+            }
+            ExprKind::EnumCtor { path, case: _, .. } => {
+                if !path.is_empty() {
+                    Some(Type::Path(Path {
+                        segments: path.iter().map(|n| PathSegment { name: n.clone(), args: vec![] }).collect()
+                    }))
+                } else {
+                    None
+                }
+            }
+            ExprKind::GcNew { ty, .. } => {
+                Some(Type::GcRef(Box::new(ty.clone())))
+            }
+            ExprKind::Ident(name) => {
+                self.local_types.borrow().get(name).cloned()
+            }
+            _ => None,
+        }
+    }
+
     fn coerce(&self, expr: &str) -> String {
         match &self.return_trait { Some(t) => format!("as_{}(new {})", t, expr), None => expr.to_string() }
+    }
+
+    /// If `from_ty` is a concrete type that implements the trait `to_ty`,
+    /// wrap the expression in as_Trait(new ConcreteType(expr)). For constructors
+    /// the expression is already the full `Dog{...}`; for variables it's just the
+    /// identifier, so we emit `new Dog(ident)`.
+    fn coerce_to(&self, expr_str: &str, from_ty: &Type, to_ty: &Type) -> (String, bool) {
+        let from_name = Self::last_name(from_ty);
+        let to_name = Self::last_name(to_ty);
+        if let (Some(concrete), Some(trait_n)) = (from_name, to_name) {
+            if self.trait_names.contains(trait_n) {
+                if let Some(impls) = self.impl_traits.get(concrete) {
+                    if impls.iter().any(|t| t == trait_n) {
+                        let alloc = if expr_str.contains('{') || expr_str.contains('(') {
+                            // Already a constructor expression like `Dog{...}` or `gc_alloc<...>(...)`
+                            format!("new {}", expr_str)
+                        } else {
+                            // A variable name or simple expression — copy-construct
+                            format!("new {}({})", concrete, expr_str)
+                        };
+                        return (format!("as_{}({})", trait_n, alloc), true);
+                    }
+                }
+            }
+        }
+        (expr_str.to_string(), false)
     }
 
     /// Table + inline cache + dynamic entry point for every dispatched name.

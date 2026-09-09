@@ -2,6 +2,7 @@ use crate::ast::*;
 use crate::error::CompileError;
 use crate::import_macro::ImportMacro;
 use crate::interpreter::{Interpreter, Value};
+use crate::profiler::Profiler;
 use crate::token::Span;
 use std::collections::HashMap;
 
@@ -50,7 +51,7 @@ impl MacroExpander {
 
     /// Expand all macro invocations in a module.
     /// This walks all items and expands macros within expressions.
-    pub fn expand_module(&mut self, module: &mut Module) -> Result<(), CompileError> {
+    pub fn expand_module(&mut self, module: &mut Module, prof: Option<&Profiler>) -> Result<(), CompileError> {
         // First pass: register macros
         let macros: Vec<MacroDef> = module.items.iter().filter_map(|item| {
             if let Item::Macro(m) = item { Some(m.clone()) } else { None }
@@ -70,7 +71,7 @@ impl MacroExpander {
                     // (they're compile-time only for now)
                 }
                 Item::MacroCall(call) => {
-                    let expanded = self.expand_module_macro(&call)?;
+                    let expanded = self.expand_module_macro(&call, prof)?;
                     // Register any macro definitions in the result
                     for item in &expanded {
                         if let Item::Macro(mdef) = item {
@@ -143,19 +144,29 @@ impl MacroExpander {
     }
 
     /// Expand a module-level macro call and return the generated items.
-    fn expand_module_macro(&mut self, call: &MacroCallItem) -> Result<Vec<Item>, CompileError> {
+    fn expand_module_macro(&mut self, call: &MacroCallItem, prof: Option<&Profiler>) -> Result<Vec<Item>, CompileError> {
         // Built-in: @import("module.path", ...) — kept for bootstrap
         if call.name == "import" {
-            // Use the userland macro when its signature fits (plain imports);
-            // selective/renaming imports are handled by the built-in.
+            // Record this import as a sub-phase under macro expand
+            if let Some(p) = prof {
+                let mod_name = call.args.first()
+                    .and_then(|a| match &a.kind { ExprKind::StringLiteral(s) => Some(s.as_str()), _ => None })
+                    .unwrap_or("?");
+                p.start(&format!("import {}", mod_name));
+            }
+            let result: Vec<Item>;
             if let Some(macro_def) = self.macros.get("import").cloned() {
                 if macro_def.params.len() == call.args.len() {
-                    let result = self.eval_macro(&macro_def, &call.args, call.span)?;
-                    return self.extract_result_items(result);
+                    let r = self.eval_macro(&macro_def, &call.args, call.span, prof)?;
+                    result = self.extract_result_items(r)?;
+                } else {
+                    result = self.import_macro.eval(&call.args, call.span, prof)?;
                 }
+            } else {
+                result = self.import_macro.eval(&call.args, call.span, prof)?;
             }
-            // Fallback to built-in import
-            return self.import_macro.eval(&call.args, call.span);
+            if let Some(p) = prof { p.end(); }
+            return Ok(result);
         }
 
         let macro_def = self.macros.get(&call.name).cloned().ok_or_else(|| {
@@ -165,7 +176,7 @@ impl MacroExpander {
             )
         })?;
 
-        let result = self.eval_macro(&macro_def, &call.args, call.span)?;
+        let result = self.eval_macro(&macro_def, &call.args, call.span, None)?;
         self.extract_result_items(result)
     }
 
@@ -236,7 +247,7 @@ impl MacroExpander {
                 })?;
 
                 // Evaluate the macro: this runs the macro body with args bound as AST
-                self.eval_macro(&macro_def, &expanded_args, span)
+                self.eval_macro(&macro_def, &expanded_args, span, None)
             }
 
             ExprKind::Quote(stmts) => {
@@ -419,6 +430,7 @@ impl MacroExpander {
         macro_def: &MacroDef,
         args: &[Expr],
         call_span: Span,
+        _prof: Option<&Profiler>,
     ) -> Result<Expr, CompileError> {
         if macro_def.params.len() != args.len() {
             return Err(CompileError::macro_err(
@@ -594,7 +606,7 @@ impl MacroExpander {
                     )
                 })?;
 
-                self.eval_macro(&macro_def, &expanded_args, span)
+                self.eval_macro(&macro_def, &expanded_args, span, None)
             }
 
             // Literals and other leaves
@@ -714,7 +726,7 @@ impl MacroExpander {
                     )
                 })?;
 
-                self.eval_macro(&macro_def, &expanded_args, span)
+                self.eval_macro(&macro_def, &expanded_args, span, None)
             }
 
             ExprKind::FuncDef(ref func) => {

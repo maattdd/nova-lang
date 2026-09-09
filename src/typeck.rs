@@ -11,6 +11,8 @@ pub struct TypeChecker {
     // Parallel to `functions`: parameter lists (names + namedness) per overload,
     // used to resolve ~name: value arguments. None for builtins.
     fn_params: HashMap<String, Vec<Option<Vec<Param>>>>,
+    // trait name → list of concrete types that implement it
+    trait_impls: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +42,7 @@ impl TypeChecker {
             fn_params.insert(name.into(), vec![None]);
         }
 
-        Self { types, functions, fn_params }
+        Self { types, functions, fn_params, trait_impls: HashMap::new() }
     }
 
     pub fn register_types(&mut self, module: &Module) {
@@ -70,6 +72,10 @@ impl TypeChecker {
                     }
                 }
                 Item::Impl(imp) => {
+                    let target = Self::last_type_name(&imp.target_type);
+                    if let Some(tn) = target {
+                        self.trait_impls.entry(imp.trait_name.clone()).or_default().push(tn.to_string());
+                    }
                     for method in &imp.methods {
                         let ft = Type::Function(FunctionType {
                             params: method.params.iter().map(|p| p.ty.clone()).collect(),
@@ -400,10 +406,20 @@ impl TypeChecker {
         } else {
             (0..args.len()).collect()
         };
+        // Score: 0 = exact match per param, 1 = coercion per param
+        let mut score = 0i32;
         for (slot, &ai) in slot_args.iter().enumerate() {
-            if !self.types_equal(&sig.params[slot], &arg_types[ai]) { return None; }
+            let param_ty = &sig.params[slot];
+            let arg_ty = &arg_types[ai];
+            if self.types_equal(param_ty, arg_ty) {
+                // exact match: no penalty
+            } else if self.can_coerce(arg_ty, param_ty) {
+                score += 1; // coercion penalty
+            } else {
+                return None;
+            }
         }
-        Some(0)
+        Some(score)
     }
 
     fn types_equal(&self, a: &Type, b: &Type) -> bool {
@@ -423,10 +439,28 @@ impl TypeChecker {
         match (expected, actual) {
             (Unit, Unit) | (Never, _) | (_, Never) => Ok(()),
             (Path(a), Path(b)) if self.types_equal(expected, actual) => Ok(()),
+            // Coercion: concrete → trait (e.g., Dog coerces to Animal)
+            (Path(_expected_path), Path(_actual_path)) if self.can_coerce(actual, expected) => Ok(()),
             (Path(a), Unit) if a.segments.iter().any(|s| s.name == "void") => Ok(()),
             (Unit, Path(b)) if b.segments.iter().any(|s| s.name == "void") => Ok(()),
             _ => Err(CompileError::type_err(format!("Type mismatch: expected '{}', got '{}'", expected, actual), span)),
         }
+    }
+
+    /// Check whether `from` is a concrete type that implements the trait `to`.
+    fn can_coerce(&self, from: &Type, to: &Type) -> bool {
+        match (from, to) {
+            (Type::Path(from_p), Type::Path(to_p)) => {
+                let fc = from_p.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                let tc = to_p.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                self.trait_impls.get(tc).map_or(false, |impls| impls.iter().any(|i| i == fc))
+            }
+            _ => false,
+        }
+    }
+
+    fn last_type_name(ty: &Type) -> Option<&str> {
+        if let Type::Path(p) = ty { p.segments.last().map(|s| s.name.as_str()) } else { None }
     }
 }
 

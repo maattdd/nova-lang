@@ -2,6 +2,7 @@ use crate::ast::*;
 use crate::error::CompileError;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
+use crate::profiler::Profiler;
 use crate::token::Span;
 use std::collections::HashMap;
 use std::fs;
@@ -46,6 +47,7 @@ impl ImportMacro {
         &mut self,
         args: &[Expr],
         call_span: Span,
+        prof: Option<&Profiler>,
     ) -> Result<Vec<Item>, CompileError> {
         if args.is_empty() {
             return Err(CompileError::macro_err(
@@ -61,7 +63,7 @@ impl ImportMacro {
         // Load the module if not cached
         let module_key = path_segments.join(".");
         if !self.cache.contains_key(&module_key) {
-            self.load_module(&path_segments)?;
+            self.load_module(&path_segments, prof)?;
         }
 
         let items_map = self.public_items.get(&module_key).ok_or_else(|| {
@@ -150,18 +152,25 @@ impl ImportMacro {
         }
     }
 
-    fn load_module(&mut self, path: &[String]) -> Result<(), CompileError> {
+    fn load_module(&mut self, path: &[String], prof: Option<&Profiler>) -> Result<(), CompileError> {
         let module_key = path.join(".");
         let file_path = self.find_module_file(path)?;
 
+        if let Some(p) = prof { p.start("file read"); }
         let source = fs::read_to_string(&file_path).map_err(|e| {
             CompileError::Generic(format!("Cannot read '{}': {}", module_key, e))
         })?;
+        if let Some(p) = prof { p.end(); }
 
+        if let Some(p) = prof { p.start("lex"); }
         let mut lex = Lexer::new(&source);
         let tokens = lex.tokenize()?;
+        if let Some(p) = prof { p.end(); }
+
+        if let Some(p) = prof { p.start("parse"); }
         let mut parser = Parser::new(tokens, &source);
         let module = parser.parse_module(path.last().cloned().unwrap_or_default())?;
+        if let Some(p) = prof { p.end(); }
 
         // Extract public items
         let mut items: HashMap<String, Item> = HashMap::new();

@@ -9,6 +9,7 @@ mod codegen;
 mod import_macro;
 mod interpreter;
 mod resolve;
+mod profiler;
 mod lsp;
 pub mod traits;
 
@@ -49,6 +50,10 @@ struct Cli {
     /// Additional search paths for modules (can be specified multiple times)
     #[arg(short = 'L', long = "lib-path")]
     lib_paths: Vec<PathBuf>,
+
+    /// Profile compiler phases and print timing report to stderr
+    #[arg(long = "profile")]
+    profile: bool,
 }
 
 #[derive(Subcommand)]
@@ -76,6 +81,10 @@ enum Commands {
         /// Keep the temporary C++ file and binary (don't delete after run)
         #[arg(long = "keep-temp")]
         keep_temp: bool,
+
+        /// Profile compiler phases and print timing report to stderr
+        #[arg(long = "profile")]
+        profile: bool,
     },
     /// Interpret a .nv file directly without compiling to C++
     Interpret {
@@ -86,6 +95,10 @@ enum Commands {
         /// Additional search paths for modules (can be specified multiple times)
         #[arg(short = 'L', long = "lib-path")]
         lib_paths: Vec<PathBuf>,
+
+        /// Profile compiler phases and print timing report to stderr
+        #[arg(long = "profile")]
+        profile: bool,
     },
 }
 
@@ -93,16 +106,16 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Run { input, standalone, lib_paths, cxx, keep_temp }) => {
-            if let Err(e) = run_nova(input, *standalone, lib_paths, &cxx, *keep_temp) {
+        Some(Commands::Run { input, standalone, lib_paths, cxx, keep_temp, profile }) => {
+            if let Err(e) = run_nova(input, *standalone, lib_paths, &cxx, *keep_temp, *profile) {
                 let source = fs::read_to_string(input).unwrap_or_default();
                 eprintln!("{}", e.display_with_source(&source, &input.display().to_string()));
                 std::process::exit(1);
             }
             return;
         }
-        Some(Commands::Interpret { input, lib_paths }) => {
-            if let Err(e) = interpret(input, lib_paths) {
+        Some(Commands::Interpret { input, lib_paths, profile }) => {
+            if let Err(e) = interpret(input, lib_paths, *profile) {
                 let source = fs::read_to_string(input).unwrap_or_default();
                 eprintln!("{}", e.display_with_source(&source, &input.display().to_string()));
                 std::process::exit(1);
@@ -123,7 +136,7 @@ fn main() {
     };
     let file_path = input.display().to_string();
 
-    if let Err(e) = run(&cli) {
+    if let Err(e) = run(&cli, cli.profile) {
         // Read source for error display
         let source = fs::read_to_string(input).unwrap_or_default();
         eprintln!("{}", e.display_with_source(&source, &file_path));
@@ -139,6 +152,7 @@ fn build_cpp(
     module_name: &str,
     print_ast: bool,
     check_only: bool,
+    prof: &profiler::Profiler,
 ) -> Result<Option<String>, CompileError> {
     // Setup search paths for @import
     let mut search_paths = lib_paths.to_vec();
@@ -152,12 +166,16 @@ fn build_cpp(
     let interpreter = interpreter::Interpreter::new(search_paths);
 
     // Lex
+    prof.start("lex");
     let mut lex = lexer::Lexer::new(source);
     let tokens = lex.tokenize()?;
+    prof.end();
 
     // Parse
+    prof.start("parse");
     let mut p = parser::Parser::new(tokens, source);
     let mut module = p.parse_module(module_name.to_string())?;
+    prof.end();
 
     if print_ast {
         println!("// ─── AST ───");
@@ -166,10 +184,11 @@ fn build_cpp(
     }
 
     // Expand macros (including @import)
+    prof.start("macro expand");
     let mut expander = macro_expand::MacroExpander::new(import_macro, interpreter);
-    // Register structs so macros can use lookup_type
     expander.register_structs(&module);
-    expander.expand_module(&mut module)?;
+    expander.expand_module(&mut module, Some(prof))?;
+    prof.end();
 
     if print_ast {
         println!("// ─── AST (after macro expansion) ───");
@@ -178,11 +197,16 @@ fn build_cpp(
     }
 
     // Type check
+    prof.start("type check");
     let mut checker = typeck::TypeChecker::new();
     checker.register_types(&module);
     let resolutions = checker.check_module(&module)?;
+    prof.end();
+
     // Apply DotAccess resolutions (field vs UFCS call)
+    prof.start("resolve");
     resolve::apply_resolutions(&mut module, &resolutions);
+    prof.end();
 
     if check_only {
         println!("Type checking passed ✓");
@@ -190,8 +214,10 @@ fn build_cpp(
     }
 
     // Generate C++
+    prof.start("codegen");
     let generator = codegen::cpp::CppGenerator::new();
     let cpp_output = generator.generate(&module);
+    prof.end();
 
     let final_output = if standalone {
         let gc_rt_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rt").join("gc.h");
@@ -215,14 +241,20 @@ fn run_nova(
     lib_paths: &[PathBuf],
     cxx: &str,
     keep_temp: bool,
+    profile: bool,
 ) -> Result<(), CompileError> {
+    let prof = profiler::Profiler::new(profile);
+
+    prof.start("file read");
     let source = fs::read_to_string(input)?;
+    prof.end();
+
     let module_name = input
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("main");
 
-    let cpp_output = build_cpp(input, &source, standalone, lib_paths, module_name, false, false)?
+    let cpp_output = build_cpp(input, &source, standalone, lib_paths, module_name, false, false, &prof)?
         .ok_or_else(|| CompileError::Generic("Unexpected check-only in run mode".into()))?;
 
     // Write to temp C++ file
@@ -241,6 +273,7 @@ fn run_nova(
     };
 
     // Compile with C++ compiler
+    prof.start("c++ compile");
     eprintln!("Compiling {} with {}...", input.display(), cxx);
     let compile_status = Command::new(cxx)
         .arg("-std=c++20")
@@ -250,6 +283,7 @@ fn run_nova(
         .arg("-o").arg(&bin_path)
         .status()
         .map_err(|e| CompileError::Generic(format!("Failed to run {}: {}", cxx, e)))?;
+    prof.end();
 
     if !compile_status.success() {
         if !keep_temp {
@@ -260,10 +294,14 @@ fn run_nova(
     }
 
     // Run the binary
+    prof.start("execution");
     eprintln!("Running {}...", bin_path.display());
     let run_status = Command::new(&bin_path)
         .status()
         .map_err(|e| CompileError::Generic(format!("Failed to run binary: {}", e)))?;
+    prof.end();
+
+    prof.report();
 
     if !run_status.success() {
         // Cleanup
@@ -283,9 +321,14 @@ fn run_nova(
     Ok(())
 }
 
-fn run(cli: &Cli) -> Result<(), CompileError> {
+fn run(cli: &Cli, profile: bool) -> Result<(), CompileError> {
+    let prof = profiler::Profiler::new(profile);
+
+    prof.start("file read");
     let input = cli.input.as_ref().unwrap();
     let source = fs::read_to_string(input)?;
+    prof.end();
+
     let module_name = input
         .file_stem()
         .and_then(|s| s.to_str())
@@ -294,8 +337,10 @@ fn run(cli: &Cli) -> Result<(), CompileError> {
 
     let cpp_output = build_cpp(
         input, &source, cli.standalone, &cli.lib_paths, &module_name,
-        cli.print_ast, cli.check_only,
+        cli.print_ast, cli.check_only, &prof,
     )?;
+
+    prof.report();
 
     // check_only returns None (already printed "Type checking passed ✓")
     if let Some(output) = cpp_output {
@@ -310,8 +355,13 @@ fn run(cli: &Cli) -> Result<(), CompileError> {
     Ok(())
 }
 
-fn interpret(input: &PathBuf, lib_paths: &[PathBuf]) -> Result<(), CompileError> {
+fn interpret(input: &PathBuf, lib_paths: &[PathBuf], profile: bool) -> Result<(), CompileError> {
+    let prof = profiler::Profiler::new(profile);
+
+    prof.start("file read");
     let source = fs::read_to_string(input)?;
+    prof.end();
+
     let module_name = input
         .file_stem()
         .and_then(|s| s.to_str())
@@ -330,34 +380,51 @@ fn interpret(input: &PathBuf, lib_paths: &[PathBuf]) -> Result<(), CompileError>
     let macro_interp = interpreter::Interpreter::new(search_paths.clone());
 
     // Lex
+    prof.start("lex");
     let mut lex = lexer::Lexer::new(&source);
     let tokens = lex.tokenize()?;
+    prof.end();
 
     // Parse
+    prof.start("parse");
     let mut p = parser::Parser::new(tokens, &source);
     let mut module = p.parse_module(module_name.clone())?;
+    prof.end();
 
     // Expand macros (including @import)
+    prof.start("macro expand");
     let mut expander = macro_expand::MacroExpander::new(import_macro, macro_interp);
     expander.register_structs(&module);
-    expander.expand_module(&mut module)?;
+    expander.expand_module(&mut module, Some(&prof))?;
+    prof.end();
 
     // Type check (resolves DotAccess → field/UFCS, etc.)
+    prof.start("type check");
     let mut checker = typeck::TypeChecker::new();
     checker.register_types(&module);
     let resolutions = checker.check_module(&module)?;
+    prof.end();
+
+    prof.start("resolve");
     resolve::apply_resolutions(&mut module, &resolutions);
+    prof.end();
 
     // Create a fresh interpreter for runtime evaluation
+    prof.start("interp setup");
     let mut rt = interpreter::Interpreter::new(search_paths);
     rt.enable_runtime_mode();
     rt.register_module(&module);
+    prof.end();
 
     // Call main()
+    prof.start("execution");
     let main_args: Vec<interpreter::Value> = vec![];
     if let Err(e) = rt.call_function("main", &main_args, crate::token::Span::zero()) {
         return Err(e);
     }
+    prof.end();
+
+    prof.report();
 
     Ok(())
 }

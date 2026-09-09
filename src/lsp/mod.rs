@@ -113,7 +113,7 @@ impl Backend {
         let interpreter = crate::interpreter::Interpreter::new(search_paths);
         let mut expander = crate::macro_expand::MacroExpander::new(import_macro, interpreter);
         expander.register_structs(module);
-        expander.expand_module(module)
+        expander.expand_module(module, None)
     }
 
     /// Compute diagnostics for a document
