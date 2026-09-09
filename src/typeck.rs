@@ -413,6 +413,10 @@ impl TypeChecker {
             let arg_ty = &arg_types[ai];
             if self.types_equal(param_ty, arg_ty) {
                 // exact match: no penalty
+            } else if is_unresolved_ctor(&args[ai]) {
+                // A payload-less enum constructor with no path (`.none`) has
+                // no type of its own: the monomorphizer leaves it unresolved
+                // and codegen converts it from context. Don't reject it.
             } else if self.can_coerce(arg_ty, param_ty) {
                 score += 1; // coercion penalty
             } else {
@@ -462,6 +466,13 @@ impl TypeChecker {
     fn last_type_name(ty: &Type) -> Option<&str> {
         if let Type::Path(p) = ty { p.segments.last().map(|s| s.name.as_str()) } else { None }
     }
+}
+
+fn is_unresolved_ctor(expr: &Expr) -> bool {
+    matches!(
+        &expr.kind,
+        ExprKind::EnumCtor { path, arg, .. } if path.is_empty() && arg.is_none()
+    )
 }
 
 fn is_unit_type(ty: &Type) -> bool {

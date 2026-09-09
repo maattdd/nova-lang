@@ -15,6 +15,7 @@ use crate::ast::*;
 use crate::error::CompileError;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
+use crate::mono::Mono;
 use crate::typeck::TypeChecker;
 
 use analysis::Document;
@@ -150,6 +151,14 @@ impl Backend {
             return diags;
         }
 
+        // Monomorphize generics — the compiler type-checks the lowered module,
+        // so the LSP must do the same or generic code (e.g. `swap(Pair...)`)
+        // shows spurious type errors.
+        if let Err(e) = Mono::lower(&module).map(|m| module = m) {
+            diags.push(Self::compile_error_to_diagnostic(&e, source));
+            return diags;
+        }
+
         // Type check
         let mut checker = TypeChecker::new();
         checker.register_types(&module);
@@ -194,30 +203,20 @@ impl Backend {
         }
     }
 
-    /// Find the token at a position in the source
+    /// Find the token at a position in the source. Lexer spans record the
+    /// line/col *after* the token, so the token occupies columns
+    /// `[span.col - len, span.col - 1]` (1-based).
     fn token_at_position(tokens: &[crate::token::Token], pos: Position) -> Option<usize> {
-        let target_offset = Self::position_to_offset(tokens, pos)?;
+        let target_line = pos.line as usize + 1;
+        let target_col = pos.character as usize + 1;
         tokens.iter().position(|t| {
-            t.span.start <= target_offset && t.span.end > target_offset
+            let len = t.span.end - t.span.start;
+            len > 0
+                && t.span.line == target_line
+                && t.span.col > len
+                && t.span.col - len <= target_col
+                && target_col <= t.span.col - 1
         })
-    }
-
-    fn position_to_offset(tokens: &[crate::token::Token], _pos: Position) -> Option<usize> {
-        // Convert line/col to byte offset using token spans
-        // For simplicity, find the line in the source using span info
-        tokens.first().map(|t| t.span.start)?;
-        // Walk tokens looking for the right line
-        let target_line = _pos.line as usize + 1;
-        let target_col = _pos.character as usize + 1;
-        for token in tokens {
-            if token.span.line == target_line
-                && token.span.col <= target_col
-                && token.span.col + (token.span.end - token.span.start) >= target_col
-            {
-                return Some(token.span.start);
-            }
-        }
-        None
     }
 
     /// Build completions at a given position
@@ -372,6 +371,279 @@ impl Backend {
         }
     }
 
+    // ─── Hover ────────────────────────────────────────────────────────────────
+
+    fn hover_md(markdown: &str, range: Option<Range>) -> Hover {
+        Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: markdown.to_string(),
+            }),
+            range,
+        }
+    }
+
+    fn token_range(token: &crate::token::Token) -> Option<Range> {
+        if token.span.line == 0 {
+            return None;
+        }
+        let len = token.span.end - token.span.start;
+        if len == 0 || token.span.col <= len {
+            return None;
+        }
+        let line = (token.span.line.max(1) - 1) as u32;
+        let start_col = (token.span.col - len - 1) as u32;
+        let end_col = (token.span.col - 1) as u32;
+        Some(Range {
+            start: Position { line, character: start_col },
+            end: Position {
+                line,
+                character: end_col,
+            },
+        })
+    }
+
+    /// Function/method signature as written in the source.
+    fn fn_signature(f: &Function) -> String {
+        let generics = if f.generics.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "[{}]",
+                f.generics
+                    .iter()
+                    .map(|g| g.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        format!(
+            "func {}{}({}) -> {}",
+            f.name,
+            generics,
+            f.params
+                .iter()
+                .map(|p| format!("{}: {}", p.name, p.ty))
+                .collect::<Vec<_>>()
+                .join(", "),
+            f.return_type
+        )
+    }
+
+    /// All function-like items (free functions, impl and trait methods).
+    fn all_functions(module: &Module) -> Vec<&Function> {
+        let mut fns = Vec::new();
+        for item in &module.items {
+            match item {
+                Item::Function(f) => fns.push(f),
+                Item::Impl(i) => fns.extend(i.methods.iter()),
+                Item::Trait(t) => fns.extend(t.methods.iter()),
+                _ => {}
+            }
+        }
+        fns
+    }
+
+    /// Hover content for a position — no document store needed.
+    fn hover_at(source: &str, uri: &str, pos: Position) -> Option<Hover> {
+        let (module, tokens) = Self::parse_source(source, uri).ok()?;
+        let idx = Self::token_at_position(&tokens, pos)?;
+        let token = &tokens[idx];
+        let crate::token::TokenKind::Ident(name) = &token.kind else {
+            return None;
+        };
+        let range = Self::token_range(token);
+        let offset = token.span.start;
+
+        // Enum case member: `.some` — the previous token is a Dot.
+        if idx > 0 && matches!(tokens[idx - 1].kind, crate::token::TokenKind::Dot) {
+            let mut cases = Vec::new();
+            for item in &module.items {
+                if let Item::Enum(e) = item {
+                    if let Some(c) = e.cases.iter().find(|c| &c.name == name) {
+                        cases.push(match &c.payload {
+                            Some(p) => format!("case {}({}) of enum {}", c.name, p, e.name),
+                            None => format!("case {} of enum {}", c.name, e.name),
+                        });
+                    }
+                }
+            }
+            if !cases.is_empty() {
+                return Some(Self::hover_md(&format!("```nova\n.{}```\n\n{}", name, cases.join("\n\n")), range));
+            }
+            // Fall through: a field named like the token is not an enum case.
+        }
+
+        // Declarations: whichever comes first in the module wins.
+        for item in &module.items {
+            match item {
+                Item::Function(f) if f.name == *name => {
+                    let note = if f.is_pub { "\n\n*(public)*" } else { "" };
+                    return Some(Self::hover_md(
+                        &format!("```nova\n{}```{}", Self::fn_signature(f), note),
+                        range,
+                    ));
+                }
+                Item::Struct(s) if s.name == *name => {
+                    let body = s
+                        .fields
+                        .iter()
+                        .map(|f| format!("  {}: {}", f.name, f.ty))
+                        .collect::<Vec<_>>()
+                        .join(",\n");
+                    let generics = if s.generics.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "[{}]",
+                            s.generics
+                                .iter()
+                                .map(|g| g.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    return Some(Self::hover_md(
+                        &format!("```nova\nstruct {}{} {{\n{}\n}}\n```", s.name, generics, body),
+                        range,
+                    ));
+                }
+                Item::Enum(e) if e.name == *name => {
+                    let cases = e
+                        .cases
+                        .iter()
+                        .map(|c| match &c.payload {
+                            Some(p) => format!("  case {}({})", c.name, p),
+                            None => format!("  case {}", c.name),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",\n");
+                    let generics = if e.generics.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "[{}]",
+                            e.generics
+                                .iter()
+                                .map(|g| g.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    return Some(Self::hover_md(
+                        &format!("```nova\nenum {}{} {{\n{}\n}}\n```", e.name, generics, cases),
+                        range,
+                    ));
+                }
+                Item::Trait(t) if t.name == *name => {
+                    let methods = t
+                        .methods
+                        .iter()
+                        .map(Self::fn_signature)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Some(Self::hover_md(
+                        &format!("```nova\ntrait {} {{\n{}\n}}\n```", t.name, methods),
+                        range,
+                    ));
+                }
+                Item::TypeAlias(a) if a.name == *name => {
+                    let generics = if a.generics.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "[{}]",
+                            a.generics
+                                .iter()
+                                .map(|g| g.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    return Some(Self::hover_md(
+                        &format!("```nova\ntype {}{} = {}\n```", a.name, generics, a.ty),
+                        range,
+                    ));
+                }
+                Item::VarDecl(v) if v.name == *name => {
+                    let kw = if v.is_mut { "var" } else { "let" };
+                    let value = match &v.ty {
+                        Some(t) => format!("{} {}: {}", kw, v.name, t),
+                        None => format!("{} {}", kw, v.name),
+                    };
+                    return Some(Self::hover_md(&format!("```nova\n{}\n```", value), range));
+                }
+                Item::Macro(m) if m.name == *name => {
+                    return Some(Self::hover_md(
+                        &format!("```nova\nmacro {}({})\n```", m.name, m.params.join(", ")),
+                        range,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        // Impl/trait methods are not top-level items; scan them too.
+        for f in Self::all_functions(&module) {
+            if f.name == *name {
+                let note = if f.is_pub { "\n\n*(public)*" } else { "" };
+                return Some(Self::hover_md(
+                    &format!("```nova\n{}```{}", Self::fn_signature(f), note),
+                    range,
+                ));
+            }
+        }
+
+        // Built-in types and runtime functions.
+        let builtin = match name.as_str() {
+            "Int" => Some("Built-in: integer (`int` in C++)"),
+            "Float" => Some("Built-in: double-precision float (`double` in C++)"),
+            "Bool" => Some("Built-in: boolean (`bool` in C++)"),
+            "String" => Some("Built-in: string (`std::string` in C++)"),
+            "Char" => Some("Built-in: character (`char` in C++)"),
+            "print" => Some("Runtime builtin: writes its argument to stdout (no newline)."),
+            "println" => Some("Runtime builtin: writes its argument to stdout followed by a newline."),
+            "print_int" => Some("Runtime builtin: writes an integer to stdout followed by a newline."),
+            _ => None,
+        };
+        if let Some(info) = builtin {
+            return Some(Self::hover_md(&format!("**{}**\n\n{}", name, info), range));
+        }
+
+        // Local variables and parameters: inferred over the original AST so
+        // generics keep their source shape (e.g. `Pair[Bool, Int]`).
+        let enclosing: Vec<&Function> = Self::all_functions(&module)
+            .into_iter()
+            .filter(|f| f.body.span.start < offset && offset <= f.body.span.end)
+            .collect();
+        for f in enclosing {
+            if let Some(ty) = crate::mono::Mono::infer_var_type_at(&module, f, name, offset) {
+                let kind = if f.params.iter().any(|p| p.name == *name) {
+                    "parameter"
+                } else {
+                    "local variable"
+                };
+                let md = format!("```nova\n{}: {}\n```\n\n*{}*", name, ty, kind);
+                return Some(Self::hover_md(&md, range));
+            }
+        }
+        // Parameter name in the signature: show the declared type as written.
+        for f in Self::all_functions(&module) {
+            if f.span.start <= offset
+                && offset < f.body.span.start
+                && f.params.iter().any(|p| p.name == *name)
+            {
+                let p = f.params.iter().find(|p| p.name == *name).unwrap();
+                let md = format!(
+                    "```nova\n{}: {}\n```\n\n*parameter of `{}`*",
+                    p.name, p.ty, f.name
+                );
+                return Some(Self::hover_md(&md, range));
+            }
+        }
+
+        None
+    }
+
     /// Completions after `recv.`: struct fields plus every function callable
     /// via UFCS — first parameter matching the receiver's type directly, or a
     /// trait the receiver implements (trait methods, impl methods, free funcs).
@@ -385,6 +657,11 @@ impl Backend {
             Self::try_parse(&patched, uri)
         })?;
         let _ = Self::expand_macros(&mut module, uri);
+        // Same lowering as the compiler: receiver inference needs concrete
+        // (monomorphic) types, otherwise generics resolve to their params.
+        if Mono::lower(&module).map(|m| module = m).is_err() {
+            return None;
+        }
 
         let mut checker = TypeChecker::new();
         checker.register_types(&module);
@@ -821,137 +1098,7 @@ impl LanguageServer for Backend {
 
         if let Some(doc) = self.documents.get(&uri) {
             let source = doc.source.clone();
-            let (module, tokens) = match Self::parse_source(&source, &uri) {
-                Ok(v) => v,
-                Err(_) => return Ok(None),
-            };
-
-            // Find the token under cursor
-            if let Some(_idx) = Self::token_at_position(&tokens, pos) {
-                let token = &tokens[_idx];
-
-                match &token.kind {
-                    crate::token::TokenKind::Ident(name) => {
-                        // Look up in module items
-                        for item in &module.items {
-                            match item {
-                                Item::Function(f) if &f.name == name => {
-                                    return Ok(Some(Hover {
-                                        contents: HoverContents::Markup(MarkupContent {
-                                            kind: MarkupKind::Markdown,
-                                            value: format!(
-                                                "```nova\nfunc {}({}) -> {}\n```\n\n{}",
-                                                f.name,
-                                                f.params
-                                                    .iter()
-                                                    .map(|p| format!("{}: {}", p.name, p.ty))
-                                                    .collect::<Vec<_>>()
-                                                    .join(", "),
-                                                f.return_type,
-                                                if f.is_pub { "*(public)*" } else { "" }
-                                            ),
-                                        }),
-                                        range: Some(Range {
-                                            start: Position {
-                                                line: (token.span.line.max(1) - 1) as u32,
-                                                character: (token.span.col.max(1) - 1) as u32,
-                                            },
-                                            end: Position {
-                                                line: (token.span.line.max(1) - 1) as u32,
-                                                character: (token.span.col.max(1) - 1
-                                                    + (token.span.end - token.span.start))
-                                                    as u32,
-                                            },
-                                        }),
-                                    }));
-                                }
-                                Item::Struct(s) if &s.name == name => {
-                                    return Ok(Some(Hover {
-                                        contents: HoverContents::Markup(MarkupContent {
-                                            kind: MarkupKind::Markdown,
-                                            value: format!(
-                                                "```nova\nstruct {} {{\n{}\n}}\n```",
-                                                s.name,
-                                                s.fields
-                                                    .iter()
-                                                    .map(|f| format!("  {}: {}", f.name, f.ty))
-                                                    .collect::<Vec<_>>()
-                                                    .join(",\n"),
-                                            ),
-                                        }),
-                                        range: Some(Range {
-                                            start: Position {
-                                                line: (token.span.line.max(1) - 1) as u32,
-                                                character: (token.span.col.max(1) - 1) as u32,
-                                            },
-                                            end: Position {
-                                                line: (token.span.line.max(1) - 1) as u32,
-                                                character: (token.span.col.max(1) - 1
-                                                    + (token.span.end - token.span.start))
-                                                    as u32,
-                                            },
-                                        }),
-                                    }));
-                                }
-                                Item::Enum(e) if &e.name == name => {
-                                    return Ok(Some(Hover {
-                                        contents: HoverContents::Markup(MarkupContent {
-                                            kind: MarkupKind::Markdown,
-                                            value: format!(
-                                                "```nova\nenum {} {{\n{}\n}}\n```",
-                                                e.name,
-                                                e.cases
-                                                    .iter()
-                                                    .map(|c| {
-                                                        if let Some(ref payload) = c.payload {
-                                                            format!("  case {}({})", c.name, payload)
-                                                        } else {
-                                                            format!("  case {}", c.name)
-                                                        }
-                                                    })
-                                                    .collect::<Vec<_>>()
-                                                    .join(",\n"),
-                                            ),
-                                        }),
-                                        range: Some(Range {
-                                            start: Position {
-                                                line: (token.span.line.max(1) - 1) as u32,
-                                                character: (token.span.col.max(1) - 1) as u32,
-                                            },
-                                            end: Position {
-                                                line: (token.span.line.max(1) - 1) as u32,
-                                                character: (token.span.col.max(1) - 1
-                                                    + (token.span.end - token.span.start))
-                                                    as u32,
-                                            },
-                                        }),
-                                    }));
-                                }
-                                _ => {}
-                            }
-                        }
-                        // Built-in types
-                        let builtin_info = match name.as_str() {
-                            "Int" => "Built-in: 64-bit signed integer (`int64_t` in C++)",
-                            "Float" => "Built-in: double-precision float (`double` in C++)",
-                            "Bool" => "Built-in: boolean (`bool` in C++)",
-                            "String" => "Built-in: string (`std::string` in C++)",
-                            "Char" => "Built-in: character (`char` in C++)",
-                            _ => "",
-                        };
-                        if !builtin_info.is_empty() {
-                            return Ok(Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value: format!("**{}**\n\n{}", name, builtin_info),
-                                }),
-                                range: None,
-                            }));
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            return Ok(Self::hover_at(&source, &uri, pos));
         }
 
         Ok(None)
@@ -1015,27 +1162,18 @@ impl LanguageServer for Backend {
                     if let crate::token::TokenKind::Ident(ref s) = t.kind {
                         if s == &name && t.span.start != tokens[idx].span.start {
                             // Check if this is a definition (preceded by func, let, var, struct, etc.)
-                            return Ok(Some(GotoDefinitionResponse::Scalar(
-                                Location {
-                                    uri: params
-                                        .text_document_position_params
-                                        .text_document
-                                        .uri
-                                        .clone(),
-                                    range: Range {
-                                        start: Position {
-                                            line: (t.span.line.max(1) - 1) as u32,
-                                            character: (t.span.col.max(1) - 1) as u32,
-                                        },
-                                        end: Position {
-                                            line: (t.span.line.max(1) - 1) as u32,
-                                            character: (t.span.col.max(1) - 1
-                                                + (t.span.end - t.span.start))
-                                                as u32,
-                                        },
+                            if let Some(range) = Self::token_range(t) {
+                                return Ok(Some(GotoDefinitionResponse::Scalar(
+                                    Location {
+                                        uri: params
+                                            .text_document_position_params
+                                            .text_document
+                                            .uri
+                                            .clone(),
+                                        range,
                                     },
-                                },
-                            )));
+                                )));
+                            }
                         }
                     }
                 }
@@ -1271,12 +1409,145 @@ mod tests {
         (source, format!("file://{}", path))
     }
 
+    fn generic_example() -> (String, String) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/test_generic.nv");
+        let source = std::fs::read_to_string(path).unwrap();
+        (source, format!("file://{}", path))
+    }
+
     fn completion_labels(source: &str, uri: &str, offset: usize) -> Vec<String> {
         Backend::dot_completions(source, uri, offset)
             .unwrap_or_default()
             .into_iter()
             .map(|i| i.label)
             .collect()
+    }
+
+    /// Byte offset of `needle` → LSP position (first occurrence).
+    fn pos_at(source: &str, needle: &str) -> Position {
+        let offset = source.find(needle).expect("needle not found");
+        let (mut line, mut col) = (0u32, 0u32);
+        for ch in source[..offset].chars() {
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        Position { line, character: col }
+    }
+
+    fn hover_value(source: &str, uri: &str, needle: &str) -> String {
+        let pos = pos_at(source, needle);
+        match Backend::hover_at(source, uri, pos) {
+            Some(h) => match h.contents {
+                HoverContents::Markup(m) => m.value,
+                _ => String::new(),
+            },
+            None => String::new(),
+        }
+    }
+
+    #[test]
+    fn generic_example_has_no_diagnostics() {
+        let (source, uri) = generic_example();
+        let diags = Backend::compute_diagnostics(&uri, &source);
+        assert!(
+            diags.is_empty(),
+            "expected no diagnostics, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hover_shows_function_signature_with_generics() {
+        let (source, uri) = generic_example();
+        let value = hover_value(&source, &uri, "swap[A, B](");
+        assert!(
+            value.contains("func swap[A, B](p: Pair[A, B]) -> Pair[B, A]"),
+            "got: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn hover_shows_generic_local_variable_type() {
+        let (source, uri) = generic_example();
+        // `t` = swap(make_pair(10, false)) → Pair[Bool, Int], pretty-printed
+        // (not the mangled Pair__bool__int).
+        let value = hover_value(&source, &uri, "t.b, 10");
+        assert!(
+            value.contains("t: Pair[Bool, Int]") && value.contains("local variable"),
+            "got: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn hover_shows_match_pattern_binding_type() {
+        let (source, uri) = generic_example();
+        // `inner` bound by `case .some(inner)` of an Option[Pair[Int, Bool]].
+        let value = hover_value(&source, &uri, "inner.a, 1");
+        assert!(
+            value.contains("inner: Pair[Int, Bool]"),
+            "got: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn hover_shows_parameter_in_signature() {
+        let (source, uri) = generic_example();
+        let value = hover_value(&source, &uri, "x: T) -> T");
+        assert!(
+            value.contains("x: T") && value.contains("parameter of `id`"),
+            "got: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn hover_shows_enum_case() {
+        let (source, uri) = generic_example();
+        // Hover the `some` in `.some(Pair { ... })`.
+        let value = hover_value(&source, &uri, "some(Pair");
+        assert!(
+            value.contains("case some(T) of enum Option"),
+            "got: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn hover_shows_struct_declaration() {
+        let (source, uri) = generic_example();
+        let value = hover_value(&source, &uri, "Pair[A, B] {");
+        assert!(
+            value.contains("struct Pair[A, B]") && value.contains("a: A"),
+            "got: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn hover_shows_trait_typed_local() {
+        let (source, uri) = matrix_example();
+        // `a` comes from make_matrix(0) → Matrix (trait type).
+        let value = hover_value(&source, &uri, "a.size(), 5");
+        assert!(
+            value.contains("a: Matrix"),
+            "got: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn hover_returns_none_for_non_identifier() {
+        let (source, uri) = generic_example();
+        // Cursor on an integer literal — not an identifier.
+        let pos = pos_at(&source, "0\n}");
+        assert!(Backend::hover_at(&source, &uri, pos).is_none());
     }
 
     #[test]
@@ -1309,6 +1580,32 @@ mod tests {
         assert!(labels.contains(&"size".into()), "trait method size missing: {:?}", labels);
         assert!(labels.contains(&"debug".into()), "debug(Matrix) missing: {:?}", labels);
         assert!(!labels.contains(&"sz".into()), "no fields on a trait type: {:?}", labels);
+    }
+
+    #[test]
+    fn dot_completion_on_generic_struct_literal_receiver() {
+        let (source, uri) = generic_example();
+        // `p` is inferred as Pair[Int, Bool]; simulate typing `p.`.
+        let broken = source.replace("assert_eq(\"pair.a int\", p.a, 1);", "p.");
+        let offset = broken.find("p.\n").unwrap() + 2;
+        let labels = completion_labels(&broken, &uri, offset);
+
+        assert!(labels.contains(&"a".into()), "field a missing: {:?}", labels);
+        assert!(labels.contains(&"b".into()), "field b missing: {:?}", labels);
+    }
+
+    #[test]
+    fn dot_completion_on_swap_receiver() {
+        let (source, uri) = generic_example();
+        // `t` comes from swap(make_pair(10, false)) → Pair[Bool, Int];
+        // the LSP must see through the generic calls and offer fields.
+        let broken = source.replace("    assert_true(\"swap moved a\", t.a == false);", "    t.");
+        let anchor = broken.find("let t = swap(make_pair(10, false));").unwrap();
+        let offset = broken[anchor..].find("t.").unwrap() + anchor + 2;
+        let labels = completion_labels(&broken, &uri, offset);
+
+        assert!(labels.contains(&"a".into()), "field a missing: {:?}", labels);
+        assert!(labels.contains(&"b".into()), "field b missing: {:?}", labels);
     }
 
     #[test]

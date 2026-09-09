@@ -122,7 +122,7 @@ pub struct GenericParam {
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Path(Path),
     GcRef(Box<Type>),         // @T — GC-managed heap reference
@@ -132,18 +132,18 @@ pub enum Type {
     Never,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionType {
     pub params: Vec<Type>,
     pub ret: Box<Type>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Path {
     pub segments: Vec<PathSegment>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PathSegment {
     pub name: String,
     pub args: Vec<Type>, // generic type arguments

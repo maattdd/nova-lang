@@ -804,12 +804,30 @@ impl Parser {
                 // Check if it's a macro invocation
                 if let TokenKind::Ident(macro_name) = &self.peek_kind().clone() {
                     let macro_name = macro_name.clone();
-                    let lookahead = self.pos + 1;
-                    let next_is_lbrace = self.tokens.get(lookahead)
+                    // Lookahead past optional generic args: `@Type[Int] { ... }`
+                    // is a GC allocation, not a macro call.
+                    let mut la = self.pos + 1;
+                    if self.tokens.get(la).map(|t| matches!(t.kind, TokenKind::LBracket)).unwrap_or(false) {
+                        let mut depth = 0;
+                        while let Some(t) = self.tokens.get(la) {
+                            match t.kind {
+                                TokenKind::LBracket => { depth += 1; }
+                                TokenKind::RBracket => {
+                                    depth -= 1;
+                                    if depth == 0 { la += 1; break; }
+                                }
+                                TokenKind::Eof => break,
+                                _ => {}
+                            }
+                            la += 1;
+                        }
+                    }
+                    let next_is_lbrace = self.tokens.get(la)
                         .map(|t| matches!(t.kind, TokenKind::LBrace))
                         .unwrap_or(false);
-                    
-                    // If next token after ident is `{`, it's a GC allocation: @Type { fields }
+
+                    // If next token after ident (and generic args) is `{`, it's
+                    // a GC allocation: @Type { fields } or @Type[Int] { fields }
                     if next_is_lbrace {
                         let ty = self.parse_type()?;
                         let fields = self.parse_struct_literal_fields()?;

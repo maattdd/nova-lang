@@ -1,0 +1,143 @@
+// test_generic.nv — First-order generics, monomorphized by Nova.
+// Generic functions, structs and enums are specialized per concrete
+// instantiation at compile time (no C++ templates involved).
+@import("std/test")
+
+enum Option[T] {
+    case some(T),
+    case none
+}
+
+enum Either[A, B] {
+    case left(A),
+    case right(B)
+}
+
+struct Pair[A, B] {
+    a: A,
+    b: B
+}
+
+// ─── Generic functions ──────────────────────────────────────────────────────
+
+func id[T](x: T) -> T {
+    return x
+}
+
+func same[T](x: T, y: T) -> T {
+    return x
+}
+
+// Two type variables, used in a composite return type.
+func make_pair[A, B](a: A, b: B) -> Pair[A, B] {
+   let foo = a;
+    return Pair { a: a, b: b }
+}
+
+// Generic struct destructuring via fields, returning another instantiation.
+func swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
+    return Pair { a: p.b, b: p.a }
+}
+
+func first[A, B](p: Pair[A, B]) -> A {
+    return p.a
+}
+
+// Generic function calling another generic function.
+func swap_twice[A, B](p: Pair[A, B]) -> Pair[A, B] {
+    return swap(swap(p))
+}
+
+// Generic function over a generic enum with pattern matching.
+func unwrap_or[T](opt: Option[T], default: T) -> T {
+    match opt {
+        case .some(v) => v
+        case .none => default
+    }
+}
+
+// Recursive generic function (self-instantiation).
+func nest[A](x: A, n: Int) -> Pair[A, A] {
+    if n <= 1 {
+        return Pair { a: x, b: x }
+    } else {
+        return nest(x, n - 1)
+    }
+}
+
+// Generic enum with two type variables, payload matching.
+func right_or[A, B](e: Either[A, B], default: B) -> B {
+    match e {
+        case .left(v) => default
+        case .right(v) => v
+    }
+}
+
+// Constructor inferred from the function's return type.
+func make_left[A](a: A) -> Either[A, String] {
+    return .left(a)
+}
+
+func main() -> Int {
+    // Generic function, multiple instantiations of the same name.
+    assert_eq("id int", id(5), 5);
+    assert_eq("id string", id("hello"), "hello");
+
+    // Two type variables inferred from arguments.
+    assert_eq("same int", same(41, 41), 41);
+
+    // Generic struct literal, type args inferred from fields.
+    let p = Pair { a: 1, b: true };
+    assert_eq("pair.a int", p.a, 1);
+    assert_true("pair.b bool", p.b);
+
+    // Explicit annotation with a generic type.
+    let r: Pair[Int, String] = Pair { a: 7, b: "seven" };
+    assert_eq("annotated pair.a", r.a, 7);
+    assert_eq("annotated pair.b", r.b, "seven");
+
+    // Generic function returning a generic struct.
+    let s = make_pair(3, "three");
+    assert_eq("make_pair first", first(s), 3);
+    assert_eq("make_pair second", s.b, "three");
+
+    // Generic struct returned through a type-changing generic function.
+    let t = swap(make_pair(10, false));
+    assert_true("swap moved a", t.a == false);
+    assert_eq("swap moved b", t.b, 10);
+
+    // Generic function calling another generic function.
+    let u = swap_twice(Pair { a: 1, b: true });
+    assert_eq("swap twice", u.a, 1);
+
+    // Nested generic types: Option of Pair.
+    let o: Option[Pair[Int, Bool]] = .some(Pair { a: 1, b: true });
+    match o {
+        case .some(inner) => assert_eq("nested some", inner.a, 1)
+        case .none => assert_true("nested none unreachable", false)
+    }
+
+    // Payload-less constructors resolve from context.
+    assert_eq("unwrap some", unwrap_or(.some(21), 0), 21);
+    let none_i: Option[Int] = .none;
+    assert_eq("unwrap none", unwrap_or(none_i, 42), 42);
+    let none_s: Option[String] = .none;
+    assert_eq("unwrap none str", unwrap_or(none_s, "dflt"), "dflt");
+
+    // Recursive generic function (nest[Int] calls nest[Int]).
+    let nested = nest(1, 3);
+    assert_eq("nested pair a", nested.a, 1);
+    assert_eq("nested pair b", nested.b, 1);
+
+    // Two-parameter generic enum: payload pins A, annotation pins B.
+    let e1: Either[Int, String] = .left(5);
+    assert_eq("either left", right_or(e1, "dflt"), "dflt");
+    let e2: Either[Int, String] = .right("x");
+    assert_eq("either right", right_or(e2, "dflt"), "x");
+
+    // Constructor instantiated from the generic function's return type.
+    let el = make_left(9);
+    assert_eq("make_left right", right_or(el, "dflt"), "dflt");
+
+    return 0
+}

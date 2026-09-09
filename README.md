@@ -162,6 +162,11 @@ Source (.nv)
 └───────────────┘
     │
     ▼
+┌──────────────────────┐
+│ Monomorphizer        │  → generics specialized per instantiation
+└──────────────────────┘
+    │
+    ▼
 ┌──────────────┐
 │ Type Checker │  → Validated AST
 └──────────────┘
@@ -171,6 +176,31 @@ Source (.nv)
 │ C++ Codegen  │  → .cpp output
 └──────────────┘
 ```
+
+### Generics (monomorphized)
+
+Generic functions, structs and enums are specialized by the compiler: every
+instantiation becomes a concrete, non-generic C++ definition
+(`Option[Int]` becomes `Option__int`, a call `id(42)` compiles to `id__int(42)`),
+so user code never relies on C++ templates. Type arguments are inferred at each
+call site from the arguments, and from annotations when a payload cannot pin
+every parameter:
+
+```nova
+enum Option[T] { case some(T), case none }
+struct Pair[A, B] { a: A, b: B }
+
+func id[T](x: T) -> T { return x }
+
+func swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
+    return Pair { a: p.b, b: p.a }
+}
+
+let o: Option[Pair[Int, Bool]] = .some(Pair { a: 1, b: true })
+let n: Option[Int] = .none     // payload-less constructors read the context
+```
+
+Only reachable instantiations are emitted; dead generic code is dropped.
 
 ## Building
 
@@ -204,6 +234,7 @@ See the `examples/` directory:
 - `gc_refs.nv` — GC-managed data structures
 - `test_min.nv` — Minimal working example
 - `test_macro.nv` — Macro expansion demo
+- `test_generic.nv` — Generic functions/structs/enums (monomorphized)
 
 ## Runtime
 
@@ -218,10 +249,11 @@ The GC runtime (`rt/gc.h`) provides:
 - ✅ Full lexer and parser
 - ✅ Julia-style macro system with quote/unquote
 - ✅ ADTs with pattern matching
+- ✅ First-order generics (functions, structs, enums) with Nova-level monomorphization
 - ✅ GC references (`@T`)
 - ✅ C++ code generation
 - ✅ Module system via `@import` macro (with renaming)
 - ✅ Basic type checking (with extern function passthrough)
 - 🚧 Standard library (print, collections)
-- 🚧 Full type inference
+- 🚧 Higher-kinded types / full type inference
 - 🚧 Pattern exhaustiveness checking

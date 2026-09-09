@@ -5,6 +5,7 @@ mod parser;
 mod error;
 mod macro_expand;
 mod typeck;
+mod mono;
 mod codegen;
 mod import_macro;
 mod interpreter;
@@ -195,6 +196,10 @@ fn build_cpp(
         println!("{:#?}", module);
         println!();
     }
+
+    // Monomorphize generics: specialize every generic item and rewrite the
+    // module so the checker and codegen never see a type parameter.
+    module = mono::Mono::lower(&module)?;
 
     // Type check
     prof.start("type check");

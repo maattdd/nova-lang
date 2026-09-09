@@ -41,6 +41,8 @@ pub struct CppGenerator {
     fn_sigs: HashMap<String, Vec<Overload>>,
     // enum case name → (enum name, tag index, has payload, enum is generic)
     enum_cases: HashMap<String, (String, usize, bool, bool)>,
+    // (enum name, case name) → (tag index, has payload)
+    enum_case_map: HashMap<(String, String), (usize, bool)>,
     // structs allocated via @T — they get a nova::GCObject base
     gc_structs: HashSet<String>,
     // local variable name → declared type (for coercion of variable references)
@@ -55,7 +57,8 @@ impl CppGenerator {
             trait_impls: BTreeMap::new(), impl_traits: HashMap::new(),
             type_ids: HashMap::new(),
             fn_sigs: HashMap::new(), enum_cases: HashMap::new(),
-            gc_structs: HashSet::new(), local_types: RefCell::new(HashMap::new()),
+            enum_case_map: HashMap::new(), gc_structs: HashSet::new(),
+            local_types: RefCell::new(HashMap::new()),
         }
     }
 
@@ -116,6 +119,10 @@ impl CppGenerator {
                     for (i, case) in e.cases.iter().enumerate() {
                         self.enum_cases.insert(case.name.clone(),
                             (e.name.clone(), i, case.payload.is_some(), !e.generics.is_empty()));
+                        self.enum_case_map.insert(
+                            (e.name.clone(), case.name.clone()),
+                            (i, case.payload.is_some()),
+                        );
                     }
                 }
                 Item::Struct(s) => {
@@ -311,6 +318,7 @@ impl CppGenerator {
                 _ => {}
             }
         }
+        self.emit_enum_tags();
         // Forward declarations before impls/functions, so any body can call
         // any function (or _d_* dispatcher) regardless of emission order.
         self.emit_fn_decls();
@@ -360,6 +368,28 @@ impl CppGenerator {
         self.emitln("");
     }
 
+    /// Conversion tags for payload-less enum constructors that no static
+    /// context pins down (monomorphized `.none` etc.): a tag converts to any
+    /// emitted enum instantiation that has the case, and C++ overload/argument
+    /// resolution picks the unique viable target.
+    fn emit_enum_tags(&mut self) {
+        let mut by_case: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for ((ename, case), (_, has_payload)) in &self.enum_case_map {
+            if !has_payload {
+                by_case.entry(case.clone()).or_default().push(ename.clone());
+            }
+        }
+        for (case, enames) in by_case {
+            self.emitln(&format!("struct nova_case_{} {{", Self::safe_ident(&case)));
+            for ename in enames {
+                self.emitln(&format!("  operator {}() const {{ return {}::{}(); }}",
+                    ename, ename, Self::safe_ident(&case)));
+            }
+            self.emitln("};");
+            self.emitln("");
+        }
+    }
+
     fn emit_struct(&mut self, s: &Struct) {
         let is_gc = self.gc_structs.contains(&s.name);
         let base = if is_gc { " : public nova::GCObject" } else { "" };
@@ -371,6 +401,10 @@ impl CppGenerator {
         let inits: Vec<String> = s.fields.iter().map(|f| format!("{0}({0})", Self::safe_ident(&f.name))).collect();
         if !args.is_empty() {
             self.emitln(&format!("  {}({}) : {} {{}}", s.name, args.join(", "), inits.join(", ")));
+            // Needed when the struct is a payload of an enum: members are
+            // value-initialized (zero-initialized, since this is not
+            // user-provided) before the tag switch.
+            self.emitln(&format!("  {}() = default;", s.name));
         }
         if is_gc {
             self.emitln("  void gc_mark(nova::GC& gc) override {");
@@ -659,16 +693,19 @@ impl CppGenerator {
             }
             ExprKind::EnumCtor { path, case, arg } => {
                 let a = arg.as_ref().map(|e| self.gen_expr(e)).unwrap_or_default();
-                match self.enum_cases.get(case) {
-                    // Generic enums go through deduction helpers: payload cases
-                    // deduce from the argument, payload-less cases produce a tag
-                    // that converts to whatever instantiation the context needs.
-                    Some((ename, _, has_payload, true)) => {
-                        if *has_payload { format!("{}__{}({})", ename, case, a) }
-                        else { format!("{}__{}_t{{}}", ename, case) }
+                if path.is_empty() {
+                    // Unresolved payload-less constructor: conversion tag.
+                    return format!("nova_case_{}{{}}", Self::safe_ident(case));
+                }
+                let ename = path.join("::");
+                if let Some((_, has_payload)) = self.enum_case_map.get(&(ename.clone(), case.clone())) {
+                    if *has_payload {
+                        format!("{}::{}({})", ename, Self::safe_ident(case), a)
+                    } else {
+                        format!("{}::{}()", ename, Self::safe_ident(case))
                     }
-                    Some((ename, _, _, false)) => format!("{}::{}({})", ename, Self::safe_ident(case), a),
-                    None => format!("{}::{}({})", path.join("::"), Self::safe_ident(case), a),
+                } else {
+                    format!("{}::{}({})", ename, Self::safe_ident(case), a)
                 }
             }
             ExprKind::Match { expr: subject, arms } => self.gen_match(subject, arms),
@@ -684,8 +721,15 @@ impl CppGenerator {
             let body = self.gen_expr(&arm.body);
             let guard = arm.guard.as_ref().map(|g| self.gen_expr(g));
             match &arm.pattern.kind {
-                PatternKind::EnumCtor { case, inner, .. } => {
-                    if let Some((_, tag, has_payload, _)) = self.enum_cases.get(case) {
+                PatternKind::EnumCtor { path, case, inner, .. } => {
+                    let ename = if !path.is_empty() {
+                        path.join("::")
+                    } else if let Some((n, _, _, _)) = self.enum_cases.get(case) {
+                        n.clone()
+                    } else {
+                        String::new()
+                    };
+                    if let Some((tag, has_payload)) = self.enum_case_map.get(&(ename.clone(), case.clone())) {
                         s.push_str(&format!("    if (_m._tag == {}) {{\n", tag));
                         if *has_payload {
                             if let Some(p) = inner {
